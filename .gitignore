@@ -1,0 +1,50 @@
+# 运行时产物
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.venv/
+
+# 敏感数据（严禁提交）
+mitm_users.json
+mitm_visit.log
+mitm_exit_telemetry.log
+mitm_client_telemetry.log
+hotspot_display.html
+mitm_logs/
+payload/*
+!payload/.gitkeep
+!payload/*/
+!payload/*/.gitkeep
+/data/
+/_mitmdump.log
+/_mitmdump.pid
+
+# Termux/安卓端临时调试脚本
+termux/_*.sh
+termux/_*.log
+termux/pc_like_start.sh
+termux/pc_like_stop.sh
+termux/start_proxy_root.sh
+termux/总控.sh
+
+# 构建产物
+android/app/build/
+android/build/
+android/.gradle/
+*.apk
+*.aab
+
+# IDE / 系统
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 其他
+*.log
+*.bak
