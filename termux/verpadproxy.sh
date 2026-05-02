@@ -251,6 +251,15 @@ cmd_run() {
     tail -n 20 "$LOG_FILE" 2>/dev/null
     return 1
   fi
+
+  # 给 wlan0 / ap0 多 2 秒拿 DHCP/IP，避免 info 输出 [B] 段误显示"无 IPv4"。
+  local i=0
+  while [ $i -lt 4 ]; do
+    if [ -n "$(_detect_ap_ip)$(_detect_wlan_ip)" ]; then break; fi
+    sleep 1
+    i=$((i+1))
+  done
+
   echo "[3/3] 连接信息:"
   cmd_info
 }
