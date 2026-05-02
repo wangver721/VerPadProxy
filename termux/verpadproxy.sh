@@ -43,11 +43,32 @@ _need_root() {
 }
 
 _mitm_pids() {
-  # 用 ss 找端口 2345 的 LISTEN 进程 PID（不会自残、零文件遍历开销）。
-  ss -lntp 2>/dev/null \
-    | awk -v p=":${MC_LISTEN_PORT:-2345}" '$0 ~ p && /pid=/{
+  # 关键：必须用 root 跑 ss，否则普通用户看不到 root 拥有的 socket 的 PID。
+  # 没看到 PID 时再用 fuser / lsof / pgrep 三重兜底。
+  local port="${MC_LISTEN_PORT:-2345}" pids=""
+
+  pids="$(_run_root "ss -lntp 2>/dev/null" 2>/dev/null \
+    | awk -v p=":${port}" '$0 ~ p && /pid=/{
         match($0, /pid=[0-9]+/); s=substr($0,RSTART,RLENGTH); sub(/pid=/, "", s); print s
-      }' | sort -u
+      }' | sort -u)"
+
+  if [ -z "$pids" ] && command -v fuser >/dev/null 2>&1; then
+    pids="$(_run_root "fuser -n tcp ${port} 2>/dev/null" 2>/dev/null \
+      | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)"
+  fi
+
+  if [ -z "$pids" ] && command -v lsof >/dev/null 2>&1; then
+    pids="$(_run_root "lsof -ti tcp:${port} 2>/dev/null" 2>/dev/null \
+      | grep -E '^[0-9]+$' | sort -u)"
+  fi
+
+  # 最终兜底：按命令名找（这是上次切歌 bug 修复时刻意避开的，但只在前面都没结果时才用）。
+  if [ -z "$pids" ]; then
+    pids="$(_run_root "pgrep -f '/mitmdump|mitmdump\\b' 2>/dev/null" 2>/dev/null \
+      | grep -E '^[0-9]+$' | sort -u)"
+  fi
+
+  echo "$pids"
 }
 
 _is_running() {
@@ -181,11 +202,35 @@ _kill_old_mitmdump() {
   done
 }
 
+_wait_port_free() {
+  # 端口空闲检查：最多等 N 秒，期间每秒重试。返回 0 = 空闲，1 = 仍占
+  local port="${MC_LISTEN_PORT:-2345}" max="${1:-6}" i=0
+  while [ $i -lt $max ]; do
+    # 端口连得通 = 还在监听 = 仍占用
+    if [ "$(_port_ok 2>/dev/null)" != "ok" ]; then
+      return 0
+    fi
+    sleep 1
+    i=$((i+1))
+  done
+  return 1
+}
+
 cmd_run() {
   # 一键：杀旧 + 起新 + 显示 IP
   echo "[1/3] 终止旧 mitmdump（如有）..."
   _kill_old_mitmdump
-  sleep 1
+  if ! _wait_port_free 4; then
+    echo "  端口 ${MC_LISTEN_PORT:-2345} 仍被占用，再杀一次..."
+    _kill_old_mitmdump
+    sleep 2
+    if ! _wait_port_free 4; then
+      echo "  仍未释放！可能存在异常进程，请手动："
+      echo "    su -c 'ss -lntp | grep ${MC_LISTEN_PORT:-2345}'"
+      echo "    su -c 'fuser -k -n tcp ${MC_LISTEN_PORT:-2345}'"
+      return 1
+    fi
+  fi
   echo "[2/3] 启动 mitmdump (root)..."
   if [ -f /sdcard/VerPadProxy/start_same_as_pc_root.sh ]; then
     _run_root 'sh /sdcard/VerPadProxy/start_same_as_pc_root.sh' >/dev/null 2>&1 || true
