@@ -42,9 +42,9 @@ _need_root() {
   fi
 }
 
-_mitm_pids() {
-  # 关键：必须用 root 跑 ss，否则普通用户看不到 root 拥有的 socket 的 PID。
-  # 没看到 PID 时再用 fuser / lsof / pgrep 三重兜底。
+# 严格：只返回真正 LISTEN 在目标端口上的进程 PID。
+# 用作 _is_running / _wait_port_free 等判定，绝不能假阳性。
+_listen_pids() {
   local port="${MC_LISTEN_PORT:-2345}" pids=""
 
   pids="$(_run_root "ss -lntp 2>/dev/null" 2>/dev/null \
@@ -62,18 +62,23 @@ _mitm_pids() {
       | grep -E '^[0-9]+$' | sort -u)"
   fi
 
-  # 最终兜底：按命令名找（这是上次切歌 bug 修复时刻意避开的，但只在前面都没结果时才用）。
-  if [ -z "$pids" ]; then
-    pids="$(_run_root "pgrep -f '/mitmdump|mitmdump\\b' 2>/dev/null" 2>/dev/null \
-      | grep -E '^[0-9]+$' | sort -u)"
-  fi
-
   echo "$pids"
 }
 
+# 宽松：所有可能跟 mitmdump 沾边的 PID（占端口的 + 名字匹配的）。
+# 用作 _kill_old_mitmdump 的清理目标，确保把外壳/僵尸残留也一并扫掉。
+_mitm_pids() {
+  local pids="" extra=""
+  pids="$(_listen_pids)"
+  extra="$(_run_root "pgrep -f 'mitmdump' 2>/dev/null" 2>/dev/null \
+    | grep -E '^[0-9]+$')"
+  printf '%s\n%s\n' "$pids" "$extra" | grep -E '^[0-9]+$' | sort -u
+}
+
 _is_running() {
+  # 只认"真的在监听端口"的进程，绝不靠 pgrep 名字匹配。
   local p
-  p="$(_mitm_pids 2>/dev/null)"
+  p="$(_listen_pids 2>/dev/null)"
   [ -n "$p" ]
 }
 
@@ -203,11 +208,11 @@ _kill_old_mitmdump() {
 }
 
 _wait_port_free() {
-  # 端口空闲检查：最多等 N 秒，期间每秒重试。返回 0 = 空闲，1 = 仍占
-  local port="${MC_LISTEN_PORT:-2345}" max="${1:-6}" i=0
+  # 端口空闲检查：最多等 N 秒，期间每秒重试。返回 0 = 空闲，1 = 仍占。
+  # 改用 _listen_pids 而非 connect 探测：进程绑了但拒绝连接的情形也能识别为"占用"。
+  local max="${1:-6}" i=0
   while [ $i -lt $max ]; do
-    # 端口连得通 = 还在监听 = 仍占用
-    if [ "$(_port_ok 2>/dev/null)" != "ok" ]; then
+    if [ -z "$(_listen_pids 2>/dev/null)" ]; then
       return 0
     fi
     sleep 1
