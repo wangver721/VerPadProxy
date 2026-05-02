@@ -2,6 +2,8 @@
 
 <div align="center">
 
+![version](https://img.shields.io/badge/version-v1.1.0-blue) ![python](https://img.shields.io/badge/python-3.10%2B-3776AB) ![mitmproxy](https://img.shields.io/badge/mitmproxy-%E2%89%A510-7e57c2) ![license](https://img.shields.io/badge/license-MIT-green) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Android%20Termux-lightgrey)
+
 **在受限网络环境里，把「可配置的 HTTP 入口」升级为可控的本地阅览台**
 
 *面向具备 Wi‑Fi 手动代理能力的终端（例如部分 **受限的教育平板**），由 **安卓宿主设备**（Termux / root 可选）承载 mitmproxy Addon，将指定主机流量改写为本仓库提供的 Web UI。*
@@ -253,7 +255,27 @@ flowchart TB
 
 ## 管理面板：用户探针 / 转码任务
 
-`/__admin` 提供分页式后台（管理员专属）：
+`/__admin` 提供分页式后台（管理员专属），所有标签共享统一的 token 鉴权与 CSRF 保护：
+
+```mermaid
+flowchart LR
+  ADM["/__admin · 管理员入口"] --> T1["用户管理"]
+  ADM --> T2["私密目录授权"]
+  ADM --> T3["创建用户"]
+  ADM --> T4["在线探针 / 用户活动"]
+  ADM --> T5["转码任务"]
+
+  T4 --> A1["实时在线列表"]
+  T4 --> A2["最近访问 URL · IP · UA · last_seen"]
+  T4 --> A3["一键踢下线"]
+
+  T5 --> B1["活跃 ffmpeg 进程"]
+  T5 --> B2["命中观看者计数"]
+  T5 --> B3["强制停止 / 清理片段缓存"]
+
+  style T4 fill:#0f3460,color:#fff
+  style T5 fill:#533483,color:#fff
+```
 
 - **用户管理**：建号、改密、特性开关、私密目录授权。
 - **在线探针 / 用户活动**：实时查看在线用户、最近一次访问的 URL、IP / UA、距今多久；可一键 **踢下线**。
@@ -306,19 +328,21 @@ cd ~/storage/shared/VerPadProxy/scripts/termux
 bash setup.sh
 ```
 
-日常启动（示例）：
+**v1.1.0 推荐：统一运维入口 `verpadproxy.sh`**（一条命令搞定杀旧进程 + 启动 + 显示连接信息）：
 
 ```bash
-bash ~/storage/shared/VerPadProxy/scripts/termux/start.sh
+bash /sdcard/VerPadProxy/scripts/termux/verpadproxy.sh up
 ```
 
-若你已验证 **root 路径下启动更稳定**，可参考仓库内 `start_same_as_pc_root.sh` 或 `verpadproxy.sh root-start`（以你设备实测为准）。
-
-**一键查看「热点场景 / 局域网场景」代理应填写的宿主 IPv4：**
-
-```bash
-bash /sdcard/VerPadProxy/scripts/termux/verpadproxy.sh info
-```
+| 子命令 | 用途 |
+|---|---|
+| `up` | 杀旧进程 + 启动 + 打印 IP/端口（**最常用**） |
+| `info` | 仅查询「热点 / 局域网」两种场景的代理主机 IP |
+| `status` | 看进程是否在跑、端口是否在监听 |
+| `restart` / `stop` / `start` | 服务生命周期管理 |
+| `logs` | 实时跟随 mitmdump 日志 |
+| `doctor` | 自检：依赖、路径、端口占用 |
+| `clean` | 截断日志、清 Python 字节码缓存 |
 
 **强烈建议安装的增强依赖（按需）：**
 
@@ -371,16 +395,30 @@ payload/
 
 ---
 
-## 近期更新
+## 版本演进
 
-- **音乐播放器**：苹果风沉浸式模式（动态 Mesh 渐变背景、封面交互动效、精确 hh:mm:ss 跳转）；跨页面悬浮窗后台播放（可拖动、半透明毛玻璃、位置持久化）；切歌不再重建歌单 DOM，封面调色板异步提取避免阻塞 `audio.play()`。
-- **沉浸式 UI 兼容性**：封面用 `aspect-ratio` + `padding-bottom` 双兜底强制正方形，老内核 WebView 也能渲染；标题 / 副信息 `flex:0 0 auto` + 显式 `min-height` 防止行盒被压缩裁切。
-- **PDF**：AJAX 翻页（不重载，不打断音乐）；任意缩放下单指拖动；缩放 / 旋转 / 平移状态持久化；按账号绑定记忆"上次看到第几页"。
-- **视频**：HLS 实时转码与 ffmpeg 参数优化（`ultrafast` / `tune=fastdecode` / 540p / `crf 23` / `maxrate 1500k`）；同一视频多观众共享转码进程；任意时刻拖拽对齐；HLS 片段强缓存。
-- **字幕**：内封轨道用 `ffprobe` 真实索引匹配；`webvtt` 直读 / `srt → vtt` / `ass → vtt` 多级提取；asscaption 转 VTT 转换器更鲁棒；后台预抽缓存到 `cache/hls/{key}/sub_{idx}.vtt`。
-- **安全**：默认启用 **单设备登录**；可选 **`?path=` Fernet 加密混淆**。
-- **管理后台**：新增 **用户在线探针** 与 **转码任务管理** 两个页签；可一键踢人 / 中断转码 / 清缓存。
-- **Termux**：`verpadproxy.sh` 整合所有运维子命令；`mc up` 改用 `ss -lntp` 探测进程，告别 ADB 下挂起；root 启动通过 `setsid nohup … & disown` 完全脱离 ADB 会话。
+### v1.1.0 — 沉浸式音乐 / 后台悬浮窗 / 全面 UX 与性能升级
+
+| 主题 | 关键改动 |
+|---|---|
+| **音乐 · 沉浸式** | Apple Music 风格全屏模式：从专辑封面提取主色生成 **动态 Mesh 渐变**；播放时封面放大 + 外发光，暂停时缩小 + 减亮；进度条 hover 时间预览；按 **时:分:秒 精确跳转**（沉浸式中也可呼出） |
+| **音乐 · 跨页悬浮窗** | 全局 mini-player：浏览 PDF / 翻文件夹时音乐持续播放；可拖动、半透明毛玻璃、位置持久化；点击展开返回主播放页 |
+| **音乐 · 性能** | 切歌只更新激活行 `class`，**不再重建歌单 DOM**；调色板提取 `setTimeout(0)` 异步执行，**不阻塞 `audio.play()`**；歌单封面 `IntersectionObserver` 懒加载；元数据按目录 mtime 服务端缓存 |
+| **UI · 老内核兼容** | 封面用 `aspect-ratio` + `padding-bottom` 双兜底强制 1:1，覆盖 Chromium <88；标题 / 副信息 `flex:0 0 auto` + 显式 `min-height`，**修复"字下半截被裁"** bug |
+| **PDF** | AJAX 翻页 + `history.pushState`（**不打断音乐**）；任意缩放下单指拖动；缩放 / 旋转 / 平移状态按文档持久化；按账号绑定记忆"上次看到第几页" |
+| **视频** | ffmpeg 参数优化（`ultrafast` / `tune=fastdecode` / 540p / `crf 23` / `maxrate 1500k`）；**同视频多观众共享转码进程**；reaper 线程 30 秒后自动收尾；HLS 片段强缓存；`MITM_MAX_TRANS` 控制并发上限 |
+| **字幕** | 内封轨道用 `ffprobe` **真实流索引**匹配，杜绝索引错位；`webvtt` 直读 / `srt → vtt` / `ass → vtt` 多级提取；ASS → VTT 转换器全面重写；缓存到 `cache/hls/{key}/sub_{idx}.vtt` |
+| **安全** | 默认启用 **单设备登录**；可选 Fernet 加密 **`?path=` URL 混淆**；会话指纹（`ip` / `ua` / `last_seen`）；默认口令改为占位强提示词，杜绝弱默认 |
+| **管理后台** | 新增 **用户在线探针** 与 **转码任务管理** 两个标签：实时在线、最近 URL、IP / UA、一键踢人 / 强停转码 / 清缓存 |
+| **Termux 运维** | `verpadproxy.sh` 整合所有子命令；`up` 改用 `ss -lntp` 探测进程**告别 ADB 下挂起**；root 启动用 `setsid nohup … </dev/null & disown` **完全脱离 ADB 会话** |
+| **代码清理** | 移除 `capture_only.py` / `log_addon.py` / `replace_pdf_addon.py` 三个废弃 addon；`_which()` / `_probe_subtitles()` / `_video_probe_compat()` 加 `lru_cache` |
+
+### v1.0.0 — 首个公开发布
+
+- 多级 PDF 渲染兜底（PyMuPDF / poppler / mupdf-tools / pdf.js）
+- 视频 HLS 实时转码 + 整片时长进度条对齐
+- 内封 / 外挂字幕协同（含 PGS 烧录）
+- Termux 一键脚本与守护进程
 
 ---
 

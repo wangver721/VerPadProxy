@@ -41,12 +41,23 @@ bash setup.sh
 
 ## 3. 日常启动
 
+**v1.1.0 推荐：用统一入口 `verpadproxy.sh up`**——它会自动杀掉旧进程（用 `ss -lntp` 探测端口占用，避免误伤当前 shell）、启动新进程，并打印代理主机 IP / 端口：
+
 ```bash
-cd ~/storage/shared/VerPadProxy/scripts/termux
-bash start.sh
+bash /sdcard/VerPadProxy/scripts/termux/verpadproxy.sh up
 ```
 
-屏幕上会把**当前网卡 IP**、监听端口、各目录路径都打印出来。
+| 子命令 | 用途 |
+|---|---|
+| `up` | 杀旧进程 + 启动 + 打印 IP/端口（**最常用**） |
+| `info` | 仅查询「热点 / 局域网」两种场景的代理主机 IP |
+| `status` | 看进程是否在跑、端口是否在监听 |
+| `restart` / `stop` / `start` | 服务生命周期管理 |
+| `logs` | 实时跟随 mitmdump 日志 |
+| `doctor` | 自检：依赖、路径、端口占用 |
+| `clean` | 截断日志、清 Python 字节码缓存 |
+
+旧版的 `bash start.sh` 仍可使用，但新部署建议直接用 `verpadproxy.sh`。
 
 ## 4. 客户端平板 连过来
 1. 客户端平板 连上安卓宿主热点；
@@ -81,9 +92,13 @@ bash start.sh
 ## 8. 故障自检
 | 现象 | 排查 |
 |------|------|
-| 客户端平板 打任何页面都走原站、没进VerPadProxy | `MITM_REDIRECT_HOSTS` 是否为 `*` 或包含目标 Host；客户端平板 代理是否生效 |
-| HTTPS 页面提示证书不受信 | 未安装 mitmproxy CA，或 客户端平板 开了 VPN/私有 DNS |
+| 客户端打任何页面都走原站、没进 VerPadProxy | `MITM_REDIRECT_HOSTS` 是否为 `*` 或包含目标 Host；客户端代理是否生效 |
+| HTTPS 页面提示证书不受信 | 未安装 mitmproxy CA，或客户端开了 VPN/私有 DNS |
 | 启动直接报 `ModuleNotFoundError: mitmproxy` | 再跑一次 `setup.sh`；或在 Termux 里 `python -m pip install mitmproxy` |
 | PDF 预览正常、翻页时缩略图空白 | `PyMuPDF` 未装；`setup.sh` 里那一步重装 |
 | 端口 2345 被占 | `MC_LISTEN_PORT` 换个别的，重启 |
 | Termux 被省电杀 | 再次确认「允许后台活动」；用 Termux:Boot + wake-lock |
+| `up` 命令长时间不返回 / 无响应 | v1.1.0 已用 `ss -lntp` 取代 `pkill -f` 防止自杀；若仍卡住，直接 `verpadproxy.sh status` 查端口和进程 |
+| 视频拖拽进度条后无图像 | ffmpeg 转码窗口正在重启，等 1-2 秒；多观众共享同一进程，转码端等就绪即可 |
+| 字幕选了"简日"却只显示一行 | v1.1.0 已修复轨道索引错位；若仍出现，删除 `cache/hls/<视频>` 目录后重看 |
+| 切歌时封面卡顿 | v1.1.0 已不重建歌单 DOM；如自定义魔改请避免在 `loadTrack` 内 `renderPlaylist()` |
