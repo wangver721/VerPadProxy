@@ -514,6 +514,10 @@ def _feature_gate_response(flow, path: str, ctx: user_auth.UserCtx) -> Response 
         if not user_auth.feature_allowed(ctx, "fe_upload"):
             return _error_page("无权使用上传。", status=403)
         return None
+    if path == "/browse_web":
+        if not user_auth.feature_allowed(ctx, "fe_browser"):
+            return _error_page("无权使用网址直跳。该功能默认关闭，请联系管理员授权。", status=403)
+        return None
     if path == "/browse":
         rel = _query_first(flow, "path", "dir", "mitm_path")
         r = (rel or "").replace("\\", "/").strip().lstrip("/")
@@ -680,6 +684,7 @@ _FE_LABELS: dict[str, str] = {
     "fe_private": "访问私密并显示入口",
     "fe_image": "图片",
     "fe_text": "文本",
+    "fe_browser": "网址直跳：输入域名后透传访问真实站点（默认关闭，谨慎授权）",
 }
 
 
@@ -725,6 +730,8 @@ def _activity_label_for_path(path: str, query: str, decoded_path: str) -> str:
         return f"⬇ 下载/读取：{short or '?'}"
     if p == "/upload":
         return "📤 上传"
+    if p == "/browse_web":
+        return "🌐 网址直跳"
     if p == "/pdf_progress":
         return "📕 同步阅读进度"
     if p.startswith("/__admin"):
@@ -2516,6 +2523,8 @@ def _home_response(flow) -> Response:
             parts_t.append(_tile('/upload', '📤', '上传到 ' + _DIR_UPLOAD, f'已存 {n_upload} 个文件（上传后可在 u/ 浏览）'))
         if user_auth.feature_allowed(ctx, "fe_browse"):
             parts_t.append(_tile('/browse', '📁', '全部文件', '文件浏览器'))
+        if user_auth.feature_allowed(ctx, "fe_browser"):
+            parts_t.append(_tile('/browse_web', '🌐', '网址直跳', '输入域名后透传访问真实站点'))
     grid_inner = "".join(parts_t) if parts_t else '<div class="card" style="grid-column:1/-1"><p class="muted" style="margin:0">当前账号未开启任何入口，请联系管理员。</p></div>'
     nav: list[str] = ['<span class="spacer"></span>']
     if ctx is not None:
@@ -6381,6 +6390,155 @@ def _upload_post_response(flow) -> Response:
 # 分发
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 网址直跳：/browse_web
+# ---------------------------------------------------------------------------
+
+_URL_HOST_RE = re.compile(r"^([A-Za-z0-9._\-]+)(?::([0-9]{1,5}))?$")
+
+
+def _normalize_browser_target(raw: str) -> tuple[str, str] | None:
+    """把用户输入的"网址"清洗为 (跳转 URL, 写入白名单的 host_token)。
+
+    - 接受 `example.com`、`example.com:8080`、`http://example.com/foo`、`https://example.com`
+    - 拒绝任何非 ASCII / 含空格 / 协议非 http(s)
+    - 返回 None 表示无效输入
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    # 自动补 http:// 协议
+    if not re.match(r"^[A-Za-z][A-Za-z0-9+\-.]*://", s):
+        s = "http://" + s
+    try:
+        p = urlparse(s)
+    except (TypeError, ValueError):
+        return None
+    if p.scheme not in ("http", "https"):
+        return None
+    host = (p.hostname or "").strip().lower()
+    if not host or not _URL_HOST_RE.match(host):
+        return None
+    port = p.port
+    # 写入白名单：同时收纳裸主机和 host:port 形式
+    if port:
+        token = f"{host}:{port}"
+    else:
+        token = host
+    # 跳转 URL 保留原始路径与查询
+    try:
+        # 重新组装确保 scheme/host 是清洗后的；保留 path、params、query、fragment
+        netloc = host + (f":{port}" if port else "")
+        path = p.path or "/"
+        rebuilt = f"{p.scheme}://{netloc}{path}"
+        if p.query:
+            rebuilt += "?" + p.query
+        if p.fragment:
+            rebuilt += "#" + p.fragment
+    except (TypeError, ValueError):
+        rebuilt = s
+    return rebuilt, token
+
+
+def _browse_web_response(flow) -> Response:
+    method = flow.request.method.upper()
+
+    if method == "POST":
+        # 解析表单
+        ctype = (flow.request.headers.get("Content-Type", "") or "").lower()
+        raw_url = ""
+        action = ""
+        target_host = ""
+        if "application/x-www-form-urlencoded" in ctype:
+            try:
+                qs = parse_qs((flow.request.content or b"").decode("utf-8", errors="replace"),
+                              keep_blank_values=True)
+                raw_url = (qs.get("url", [""]) or [""])[0]
+                action = (qs.get("action", [""]) or [""])[0]
+                target_host = (qs.get("host", [""]) or [""])[0]
+            except (UnicodeDecodeError, ValueError):
+                pass
+        if action == "remove" and target_host:
+            _browser_bypass_remove(target_host)
+            return Response.make(303, b"",
+                                 {"Location": "/browse_web", "Cache-Control": "no-store"})
+        norm = _normalize_browser_target(raw_url)
+        if not norm:
+            return _browse_web_render(flow, notice="网址无效。示例：example.com 或 http://example.com:8080/path")
+        target_url, token = norm
+        _browser_bypass_add(token)
+        # 直接 302 到真实 URL；下一跳 mitmproxy 会发现 host 在白名单，原样转发
+        return Response.make(303, b"",
+                             {"Location": target_url, "Cache-Control": "no-store"})
+
+    return _browse_web_render(flow)
+
+
+def _browse_web_render(flow, *, notice: str = "") -> Response:
+    hosts = sorted(_browser_bypass_hosts())
+    notice_html = (f'<div class="card" style="border-color:rgba(255,180,124,.4);color:#ffd9b5">'
+                   f'{html.escape(notice)}</div>') if notice else ""
+    if hosts:
+        rows: list[str] = []
+        for h in hosts:
+            rows.append(
+                f'<tr><td><code>{html.escape(h)}</code></td>'
+                f'<td style="text-align:right">'
+                f'  <form method="post" action="/browse_web" style="display:inline">'
+                f'    <input type="hidden" name="action" value="remove">'
+                f'    <input type="hidden" name="host" value="{html.escape(h)}">'
+                f'    <button class="btn btn-ghost btn-sm" type="submit" onclick="return confirm(\'移除 {html.escape(h)} 的透传？\')">移除</button>'
+                f'  </form>'
+                f'</td></tr>'
+            )
+        list_html = (
+            '<div class="card"><div class="muted" style="margin-bottom:6px">已授权透传的站点（mitmproxy 不再改写其响应）：</div>'
+            '<table style="width:100%;border-collapse:collapse"><thead><tr>'
+            '<th style="text-align:left;padding:6px 4px;border-bottom:1px solid rgba(255,255,255,.12)">Host</th>'
+            '<th style="text-align:right;padding:6px 4px;border-bottom:1px solid rgba(255,255,255,.12)">操作</th>'
+            '</tr></thead><tbody>'
+            + "".join(rows) +
+            '</tbody></table></div>'
+        )
+    else:
+        list_html = '<div class="card"><p class="muted" style="margin:0">尚未授权任何站点。提交下方表单后，该域名会被加入白名单并立即跳转。</p></div>'
+
+    body = f"""
+<div class="topbar">
+  <a class="btn btn-ghost btn-sm" href="/">🏠</a>
+  <span class="brand">网址直跳</span>
+  <span class="spacer"></span>
+</div>
+<div class="content">
+  {notice_html}
+  <div class="card">
+    <form method="post" action="/browse_web">
+      <p class="muted" style="margin-top:0">
+        输入网址后，该站点的 host 会被加入透传白名单，mitmproxy 不再改写它的响应；
+        浏览器会被立刻 302 重定向到该 URL。<br>
+        HTTPS 站点通过默认 CONNECT 透传可达；HTTP 站点需当前 host 已在白名单中。
+      </p>
+      <input class="input" type="url" name="url" placeholder="example.com 或 http://example.com:8080/path"
+             required autofocus style="width:100%" inputmode="url" autocomplete="off"
+             autocapitalize="off" autocorrect="off" spellcheck="false">
+      <div class="row" style="margin-top:12px">
+        <button class="btn btn-primary" type="submit">前往</button>
+        <a class="btn btn-ghost" href="/">取消</a>
+      </div>
+    </form>
+  </div>
+  {list_html}
+  <div class="card">
+    <p class="muted" style="margin:0;font-size:.86rem;line-height:1.7">
+      <strong>注意</strong>：此功能会让指定域名绕过 VerPadProxy 的页面改写，原样到达真实站点。
+      仅供合规自用场景（如访问家庭 NAS、本地路由器后台、自托管服务）。
+      不要用于规避任何授权控制 / 访问限制。
+    </p>
+  </div>
+</div>"""
+    return _html_response(_shell("网址直跳", body))
+
+
 def _dispatch_open(flow, path: Path) -> Response:
     kind = _classify(path)
     if kind == "pdf":
@@ -6415,6 +6573,99 @@ def _resolve_path_from_query(flow) -> Path | None:
 # ---------------------------------------------------------------------------
 # 路由
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 浏览器直跳：host 白名单透传
+# ---------------------------------------------------------------------------
+# 设计：用户通过 /browse_web 输入 URL 后，把 host:port 加入此集合。
+# request() hook 早期检查命中即 return，让 mitmproxy 默认转发到上游。
+# HTTPS 走 CONNECT，无须额外处理（CONNECT 默认透传）。
+_BROWSER_BYPASS_LOCK = threading.RLock()
+
+
+def _browser_bypass_path() -> Path:
+    env = (os.environ.get("MITM_DATA_DIR", "") or "").strip()
+    base = Path(env).expanduser().resolve() if env else _BASE
+    return base / "browser_bypass.json"
+
+
+def _browser_bypass_load() -> dict:
+    p = _browser_bypass_path()
+    if not p.is_file():
+        return {"hosts": []}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8") or "{}")
+        if not isinstance(d, dict):
+            return {"hosts": []}
+        if not isinstance(d.get("hosts"), list):
+            d["hosts"] = []
+        return d
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {"hosts": []}
+
+
+def _browser_bypass_save(data: dict) -> None:
+    p = _browser_bypass_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp.replace(p)
+    except OSError:
+        pass
+
+
+def _browser_bypass_hosts() -> set[str]:
+    """返回当前白名单（host 或 host:port，全小写）。"""
+    with _BROWSER_BYPASS_LOCK:
+        d = _browser_bypass_load()
+        out: set[str] = set()
+        for h in d.get("hosts", []):
+            if isinstance(h, str) and h.strip():
+                out.add(h.strip().lower())
+        return out
+
+
+def _browser_bypass_add(host_with_port: str) -> None:
+    h = (host_with_port or "").strip().lower()
+    if not h:
+        return
+    with _BROWSER_BYPASS_LOCK:
+        d = _browser_bypass_load()
+        hosts = [x for x in d.get("hosts", []) if isinstance(x, str)]
+        if h not in (x.lower() for x in hosts):
+            hosts.append(h)
+            d["hosts"] = hosts
+            _browser_bypass_save(d)
+
+
+def _browser_bypass_remove(host_with_port: str) -> None:
+    h = (host_with_port or "").strip().lower()
+    if not h:
+        return
+    with _BROWSER_BYPASS_LOCK:
+        d = _browser_bypass_load()
+        d["hosts"] = [x for x in d.get("hosts", []) if isinstance(x, str) and x.strip().lower() != h]
+        _browser_bypass_save(d)
+
+
+def _is_browser_bypass(flow) -> bool:
+    """该次请求是否命中浏览器白名单。同时兼容裸主机和 host:port。"""
+    try:
+        bypass = _browser_bypass_hosts()
+        if not bypass:
+            return False
+        h, port = _request_host_port(flow)
+        if not h:
+            return False
+        h = h.lower()
+        if h in bypass:
+            return True
+        return f"{h}:{port}" in bypass
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
 
 # PDF 阅读进度：账号 + 相对路径 → 上次页码
 _PDF_PROG_LOCK = threading.RLock()
@@ -6618,6 +6869,8 @@ def _route(flow) -> Response:
             return _dispatch_open(flow, p)
         if path == "/browse":
             return _browse_response(flow)
+        if path == "/browse_web":
+            return _browse_web_response(flow)
         # 兜底：首页
         return _home_response(flow)
     except Exception as e:  # noqa: BLE001
@@ -6637,6 +6890,9 @@ def request(flow) -> None:
         u = f"{_normalize_host(flow)}{_url_path(flow)}"
     _log_visit_line("HTTP", f"{flow.request.method.upper()}\t{u}", flow)
     if not _host_matches(flow):
+        return
+    # 浏览器直跳：命中白名单则跳过改写，让 mitmproxy 默认转发到真实上游
+    if _is_browser_bypass(flow):
         return
     flow.response = _route(flow)
 

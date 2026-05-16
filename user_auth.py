@@ -34,11 +34,12 @@ _SESSIONS: dict[str, dict[str, Any]] = {}
 # 各功能是否可见/可用（管理员默认全开）
 FE_KEYS = (
     "fe_home", "fe_pdf", "fe_video", "fe_music", "fe_upload", "fe_browse",
-    "fe_upl", "fe_private", "fe_image", "fe_text",
+    "fe_upl", "fe_private", "fe_image", "fe_text", "fe_browser",
 )
 DEFAULT_FEATURES = {k: True for k in FE_KEYS}
 DEFAULT_FEATURES["fe_upl"] = True
 DEFAULT_FEATURES["fe_private"] = False
+DEFAULT_FEATURES["fe_browser"] = False  # 浏览器直跳默认关闭：会让 host 进白名单透传，谨慎授权
 
 
 @dataclass
