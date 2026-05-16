@@ -1,0 +1,175 @@
+<style>
+html,body{margin:0;padding:0;height:100%;overflow:hidden}
+.app.browser-app{display:flex;flex-direction:column;height:100vh;height:100dvh;max-width:100%!important;padding:0!important}
+.browser-chrome{flex:0 0 auto;z-index:100;background:rgba(18,22,34,.94);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-bottom:1px solid rgba(255,255,255,.1)}
+.browser-tabs{display:flex;align-items:center;gap:4px;padding:6px 8px 0;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.browser-tab{flex:0 0 auto;max-width:150px;padding:6px 10px;border-radius:10px 10px 0 0;background:rgba(255,255,255,.06);color:rgba(236,241,255,.75);font-size:.78rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;border:1px solid transparent}
+.browser-tab.active{background:rgba(95,161,255,.25);color:#fff;border-color:rgba(255,255,255,.14)}
+.browser-tab .x{margin-left:6px;opacity:.75;font-weight:700}
+.browser-toolbar{display:flex;align-items:center;gap:6px;padding:8px 10px 10px;flex-wrap:nowrap}
+.browser-toolbar .btn{min-height:40px;min-width:40px;padding:0 10px;flex:0 0 auto}
+.browser-url{flex:1;min-width:0}
+.browser-url .input{width:100%;box-sizing:border-box}
+.browser-stage{flex:1 1 auto;min-height:0;position:relative;background:#0c0e14}
+.browser-frame{position:absolute;inset:0;width:100%;height:100%;border:0;background:#fff;display:none}
+.browser-frame.active{display:block}
+.browser-mode{font-size:.75rem;color:rgba(236,241,255,.65);white-space:nowrap;display:flex;align-items:center;gap:4px}
+.browser-hint{font-size:.72rem;color:rgba(236,241,255,.45);padding:0 10px 6px}
+</style>
+<div class="browser-chrome">
+  <div class="browser-tabs" id="b-tabs"></div>
+  <div class="browser-toolbar">
+    <a class="btn btn-ghost btn-sm" href="/" title="VerPadProxy 首页">🏠</a>
+    <button type="button" class="btn btn-ghost btn-sm" id="b-back" title="后退">◀</button>
+    <button type="button" class="btn btn-ghost btn-sm" id="b-fwd" title="前进">▶</button>
+    <button type="button" class="btn btn-primary btn-sm" id="b-refresh" title="刷新">↻</button>
+    <div class="browser-url"><input class="input" id="b-url" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="输入网址，如 bilibili.com"></div>
+    <button type="button" class="btn btn-primary btn-sm" id="b-go">前往</button>
+    <button type="button" class="btn btn-ghost btn-sm" id="b-new" title="新标签">＋</button>
+    <label class="browser-mode"><input type="checkbox" id="b-direct"> 直连</label>
+  </div>
+  <div class="browser-hint">默认「代理」：由手机联网代拉网页再转发给 Pad；复杂站点可勾选「直连」</div>
+</div>
+<div class="browser-stage" id="b-stage"></div>
+<script>
+(function(){
+  var STORAGE="mitm_browser_v2";
+  var startUrl=/*START_URL*/"";
+  function norm(raw){
+    raw=(raw||"").trim();
+    if(!raw)return null;
+    if(!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw))raw="https://"+raw;
+    try{new URL(raw);return raw;}catch(e){return null;}
+  }
+  function proxy(u){return "/browser/proxy?url="+encodeURIComponent(u);}
+  function load(){try{return JSON.parse(sessionStorage.getItem(STORAGE)||"")||null;}catch(e){return null;}}
+  function save(st){try{sessionStorage.setItem(STORAGE,JSON.stringify(st));}catch(e){}}
+  function newTab(url){return {id:"t"+Date.now(),url:url||"",title:url||"新标签",hist:[],histIdx:-1,direct:false};}
+  var st=load();
+  if(!st||!st.tabs||!st.tabs.length){st={tabs:[newTab(startUrl||"")],active:0};}
+  if(typeof st.active!=="number")st.active=0;
+  var tabsEl=document.getElementById("b-tabs");
+  var stageEl=document.getElementById("b-stage");
+  var urlIn=document.getElementById("b-url");
+  var directCb=document.getElementById("b-direct");
+  function cur(){return st.tabs[st.active]||st.tabs[0];}
+  function frameSrc(tab){
+    if(!tab.url)return "about:blank";
+    if(tab.direct||directCb.checked)return tab.url;
+    return proxy(tab.url);
+  }
+  function pushHist(tab,url){
+    if(!url)return;
+    if(tab.histIdx<tab.hist.length-1)tab.hist=tab.hist.slice(0,tab.histIdx+1);
+    if(tab.hist[tab.histIdx]!==url){tab.hist.push(url);tab.histIdx=tab.hist.length-1;}
+  }
+  function renderTabs(){
+    tabsEl.innerHTML="";
+    st.tabs.forEach(function(tab,i){
+      var el=document.createElement("div");
+      el.className="browser-tab"+(i===st.active?" active":"");
+      var label=(tab.title||tab.url||"新标签").replace(/^https?:\/\//,"");
+      el.appendChild(document.createTextNode(label));
+      var x=document.createElement("span");
+      x.className="x";x.textContent="×";
+      x.onclick=function(e){e.stopPropagation();closeTab(i);};
+      el.appendChild(x);
+      el.onclick=function(){switchTab(i);};
+      tabsEl.appendChild(el);
+    });
+  }
+  function renderFrames(){
+    stageEl.innerHTML="";
+    st.tabs.forEach(function(tab,i){
+      var f=document.createElement("iframe");
+      f.className="browser-frame"+(i===st.active?" active":"");
+      f.id="bf-"+tab.id;
+      f.setAttribute("sandbox","allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox");
+      if(i===st.active){
+        f.src=frameSrc(tab);
+        f.onload=function(){
+          try{
+            if(!tab.direct&&!directCb.checked&&f.contentDocument&&f.contentDocument.title){
+              tab.title=f.contentDocument.title;
+              renderTabs();
+            }
+          }catch(e){}
+        };
+      }
+      stageEl.appendChild(f);
+    });
+    var t=cur();
+    if(t){urlIn.value=t.url||"";directCb.checked=!!t.direct;}
+    save(st);
+  }
+  function switchTab(i){st.active=i;renderTabs();renderFrames();}
+  function closeTab(i){
+    if(st.tabs.length<=1){st.tabs=[newTab("")];st.active=0;}
+    else{
+      st.tabs.splice(i,1);
+      if(st.active>=st.tabs.length)st.active=st.tabs.length-1;
+      else if(i<st.active)st.active--;
+    }
+    renderTabs();renderFrames();
+  }
+  function allowDirect(url){
+    return fetch("/browser/allow?url="+encodeURIComponent(url),{credentials:"same-origin"}).catch(function(){});
+  }
+  function navigate(raw,opts){
+    opts=opts||{};
+    var u=norm(raw);
+    if(!u){alert("网址无效");return;}
+    var tab=cur();
+    tab.url=u;
+    tab.title=u;
+    tab.direct=!!(opts.direct!==undefined?opts.direct:directCb.checked);
+    if(tab.direct)allowDirect(u);
+    if(!opts.noPush)pushHist(tab,u);
+    urlIn.value=u;
+    var f=document.getElementById("bf-"+tab.id);
+    if(f)f.src=frameSrc(tab);
+    else renderFrames();
+    renderTabs();
+    save(st);
+  }
+  document.getElementById("b-go").onclick=function(){navigate(urlIn.value);};
+  urlIn.addEventListener("keydown",function(e){if(e.key==="Enter")navigate(urlIn.value);});
+  document.getElementById("b-refresh").onclick=function(){
+    var tab=cur();
+    var f=document.getElementById("bf-"+tab.id);
+    if(f&&tab.url){
+      if(tab.direct||directCb.checked){allowDirect(tab.url).then(function(){f.src=tab.url;});}
+      else f.src=proxy(tab.url);
+    }
+  };
+  document.getElementById("b-back").onclick=function(){
+    var tab=cur();
+    if(tab.histIdx>0){tab.histIdx--;navigate(tab.hist[tab.histIdx],{direct:tab.direct,noPush:true});}
+  };
+  document.getElementById("b-fwd").onclick=function(){
+    var tab=cur();
+    if(tab.histIdx<tab.hist.length-1){tab.histIdx++;navigate(tab.hist[tab.histIdx],{direct:tab.direct,noPush:true});}
+  };
+  document.getElementById("b-new").onclick=function(){
+    st.tabs.push(newTab(""));st.active=st.tabs.length-1;renderTabs();renderFrames();urlIn.focus();
+  };
+  directCb.onchange=function(){
+    var tab=cur();tab.direct=directCb.checked;
+    if(tab.url)navigate(tab.url,{direct:tab.direct,noPush:true});
+  };
+  window.addEventListener("message",function(ev){
+    if(!ev.data||ev.data.t!=="nav")return;
+    var u=ev.data.u||"";
+    if(u.indexOf("/browser/proxy?url=")>=0){
+      try{
+        var q=u.split("url=")[1];
+        u=decodeURIComponent(q.split("&")[0]);
+      }catch(e){}
+    }
+    navigate(u);
+  });
+  renderTabs();
+  if(startUrl)navigate(startUrl);
+  else renderFrames();
+})();
+</script>

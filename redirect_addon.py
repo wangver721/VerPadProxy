@@ -47,7 +47,8 @@ from email.parser import BytesParser
 from email.policy import default as email_policy
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
+from urllib.request import Request, urlopen
 
 from mitmproxy.http import Response
 
@@ -514,9 +515,13 @@ def _feature_gate_response(flow, path: str, ctx: user_auth.UserCtx) -> Response 
         if not user_auth.feature_allowed(ctx, "fe_upload"):
             return _error_page("无权使用上传。", status=403)
         return None
+    if path == "/browser" or path.startswith("/browser/"):
+        if not user_auth.feature_allowed(ctx, "fe_browser"):
+            return _error_page("无权使用内置浏览器。该功能默认关闭，请联系管理员授权。", status=403)
+        return None
     if path == "/browse_web":
         if not user_auth.feature_allowed(ctx, "fe_browser"):
-            return _error_page("无权使用网址直跳。该功能默认关闭，请联系管理员授权。", status=403)
+            return _error_page("无权使用内置浏览器。该功能默认关闭，请联系管理员授权。", status=403)
         return None
     if path == "/browse":
         rel = _query_first(flow, "path", "dir", "mitm_path")
@@ -684,7 +689,7 @@ _FE_LABELS: dict[str, str] = {
     "fe_private": "访问私密并显示入口",
     "fe_image": "图片",
     "fe_text": "文本",
-    "fe_browser": "网址直跳：输入域名后透传访问真实站点（默认关闭，谨慎授权）",
+    "fe_browser": "内置浏览器：多标签 + 手机代拉网页转发（默认关闭，谨慎授权）",
 }
 
 
@@ -730,8 +735,10 @@ def _activity_label_for_path(path: str, query: str, decoded_path: str) -> str:
         return f"⬇ 下载/读取：{short or '?'}"
     if p == "/upload":
         return "📤 上传"
+    if p == "/browser" or p.startswith("/browser/"):
+        return "🌐 内置浏览器"
     if p == "/browse_web":
-        return "🌐 网址直跳"
+        return "🌐 内置浏览器"
     if p == "/pdf_progress":
         return "📕 同步阅读进度"
     if p.startswith("/__admin"):
@@ -2524,7 +2531,7 @@ def _home_response(flow) -> Response:
         if user_auth.feature_allowed(ctx, "fe_browse"):
             parts_t.append(_tile('/browse', '📁', '全部文件', '文件浏览器'))
         if user_auth.feature_allowed(ctx, "fe_browser"):
-            parts_t.append(_tile('/browse_web', '🌐', '网址直跳', '输入域名后透传访问真实站点'))
+            parts_t.append(_tile('/browser', '🌐', '浏览器', '多标签 · 地址栏常驻 · 手机代拉网页'))
     grid_inner = "".join(parts_t) if parts_t else '<div class="card" style="grid-column:1/-1"><p class="muted" style="margin:0">当前账号未开启任何入口，请联系管理员。</p></div>'
     nav: list[str] = ['<span class="spacer"></span>']
     if ctx is not None:
@@ -6391,10 +6398,20 @@ def _upload_post_response(flow) -> Response:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# 网址直跳：/browse_web
+# 内置浏览器：/browser · /browser/proxy · /browser/allow
 # ---------------------------------------------------------------------------
 
 _URL_HOST_RE = re.compile(r"^([A-Za-z0-9._\-]+)(?::([0-9]{1,5}))?$")
+_BROWSER_UA = (
+    "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+)
+_BROWSER_MAX_BYTES = 12 * 1024 * 1024
+_BROWSER_FETCH_TIMEOUT = 28
+_HREF_SRC_RE = re.compile(
+    r'(?P<attr>href|src|action)\s*=\s*(?P<q>["\'])(?P<val>(?:(?!\2).)*)(?P=q)',
+    re.IGNORECASE,
+)
 
 
 def _normalize_browser_target(raw: str) -> tuple[str, str] | None:
@@ -6440,103 +6457,128 @@ def _normalize_browser_target(raw: str) -> tuple[str, str] | None:
     return rebuilt, token
 
 
-def _browse_web_response(flow) -> Response:
-    method = flow.request.method.upper()
-
-    if method == "POST":
-        # 解析表单
-        ctype = (flow.request.headers.get("Content-Type", "") or "").lower()
-        raw_url = ""
-        action = ""
-        target_host = ""
-        if "application/x-www-form-urlencoded" in ctype:
-            try:
-                qs = parse_qs((flow.request.content or b"").decode("utf-8", errors="replace"),
-                              keep_blank_values=True)
-                raw_url = (qs.get("url", [""]) or [""])[0]
-                action = (qs.get("action", [""]) or [""])[0]
-                target_host = (qs.get("host", [""]) or [""])[0]
-            except (UnicodeDecodeError, ValueError):
-                pass
-        if action == "remove" and target_host:
-            _browser_bypass_remove(target_host)
-            return Response.make(303, b"",
-                                 {"Location": "/browse_web", "Cache-Control": "no-store"})
-        norm = _normalize_browser_target(raw_url)
-        if not norm:
-            return _browse_web_render(flow, notice="网址无效。示例：example.com 或 http://example.com:8080/path")
-        target_url, token = norm
-        _browser_bypass_add(token)
-        # 直接 302 到真实 URL；下一跳 mitmproxy 会发现 host 在白名单，原样转发
-        return Response.make(303, b"",
-                             {"Location": target_url, "Cache-Control": "no-store"})
-
-    return _browse_web_render(flow)
+def _browser_proxify_url(abs_url: str) -> str:
+    return "/browser/proxy?url=" + quote(abs_url, safe="")
 
 
-def _browse_web_render(flow, *, notice: str = "") -> Response:
-    hosts = sorted(_browser_bypass_hosts())
-    notice_html = (f'<div class="card" style="border-color:rgba(255,180,124,.4);color:#ffd9b5">'
-                   f'{html.escape(notice)}</div>') if notice else ""
-    if hosts:
-        rows: list[str] = []
-        for h in hosts:
-            rows.append(
-                f'<tr><td><code>{html.escape(h)}</code></td>'
-                f'<td style="text-align:right">'
-                f'  <form method="post" action="/browse_web" style="display:inline">'
-                f'    <input type="hidden" name="action" value="remove">'
-                f'    <input type="hidden" name="host" value="{html.escape(h)}">'
-                f'    <button class="btn btn-ghost btn-sm" type="submit" onclick="return confirm(\'移除 {html.escape(h)} 的透传？\')">移除</button>'
-                f'  </form>'
-                f'</td></tr>'
-            )
-        list_html = (
-            '<div class="card"><div class="muted" style="margin-bottom:6px">已授权透传的站点（mitmproxy 不再改写其响应）：</div>'
-            '<table style="width:100%;border-collapse:collapse"><thead><tr>'
-            '<th style="text-align:left;padding:6px 4px;border-bottom:1px solid rgba(255,255,255,.12)">Host</th>'
-            '<th style="text-align:right;padding:6px 4px;border-bottom:1px solid rgba(255,255,255,.12)">操作</th>'
-            '</tr></thead><tbody>'
-            + "".join(rows) +
-            '</tbody></table></div>'
-        )
+def _browser_rewrite_html(html_text: str, page_url: str) -> str:
+    def _fix_val(val: str) -> str:
+        v = (val or "").strip()
+        if not v or v.startswith("#"):
+            return v
+        low = v.lower()
+        if low.startswith(("javascript:", "mailto:", "data:", "blob:")):
+            return v
+        abs_u = urljoin(page_url, v)
+        if abs_u.startswith(("http://", "https://")):
+            return _browser_proxify_url(abs_u)
+        return v
+
+    def _repl(m: re.Match[str]) -> str:
+        nv = _fix_val(m.group("val"))
+        return f'{m.group("attr")}={m.group("q")}{nv}{m.group("q")}'
+
+    out = _HREF_SRC_RE.sub(_repl, html_text)
+    inject = (
+        '<meta name="referrer" content="no-referrer">'
+        '<script>(function(){document.addEventListener("click",function(e){'
+        'var a=e.target.closest("a");if(!a||!a.href)return;'
+        'if(a.href.indexOf("/browser/proxy")===0){e.preventDefault();'
+        'parent.postMessage({t:"nav",u:a.href},"*");}},true);})();</script>'
+    )
+    if re.search(r"</head>", out, re.IGNORECASE):
+        out = re.sub(r"</head>", inject + "</head>", out, count=1, flags=re.IGNORECASE)
     else:
-        list_html = '<div class="card"><p class="muted" style="margin:0">尚未授权任何站点。提交下方表单后，该域名会被加入白名单并立即跳转。</p></div>'
+        out = inject + out
+    return out
 
-    body = f"""
-<div class="topbar">
-  <a class="btn btn-ghost btn-sm" href="/">🏠</a>
-  <span class="brand">网址直跳</span>
-  <span class="spacer"></span>
-</div>
-<div class="content">
-  {notice_html}
-  <div class="card">
-    <form method="post" action="/browse_web">
-      <p class="muted" style="margin-top:0">
-        输入网址后，该站点的 host 会被加入透传白名单，mitmproxy 不再改写它的响应；
-        浏览器会被立刻 302 重定向到该 URL。<br>
-        HTTPS 站点通过默认 CONNECT 透传可达；HTTP 站点需当前 host 已在白名单中。
-      </p>
-      <input class="input" type="url" name="url" placeholder="example.com 或 http://example.com:8080/path"
-             required autofocus style="width:100%" inputmode="url" autocomplete="off"
-             autocapitalize="off" autocorrect="off" spellcheck="false">
-      <div class="row" style="margin-top:12px">
-        <button class="btn btn-primary" type="submit">前往</button>
-        <a class="btn btn-ghost" href="/">取消</a>
-      </div>
-    </form>
-  </div>
-  {list_html}
-  <div class="card">
-    <p class="muted" style="margin:0;font-size:.86rem;line-height:1.7">
-      <strong>注意</strong>：此功能会让指定域名绕过 VerPadProxy 的页面改写，原样到达真实站点。
-      仅供合规自用场景（如访问家庭 NAS、本地路由器后台、自托管服务）。
-      不要用于规避任何授权控制 / 访问限制。
-    </p>
-  </div>
-</div>"""
-    return _html_response(_shell("网址直跳", body))
+
+def _browser_fetch_url(url: str) -> tuple[bytes, str]:
+    req = Request(
+        url,
+        headers={
+            "User-Agent": _BROWSER_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+        method="GET",
+    )
+    with urlopen(req, timeout=_BROWSER_FETCH_TIMEOUT) as resp:
+        body = resp.read(_BROWSER_MAX_BYTES + 1)
+        if len(body) > _BROWSER_MAX_BYTES:
+            body = body[:_BROWSER_MAX_BYTES]
+        ctype = resp.headers.get("Content-Type", "") or "application/octet-stream"
+        return body, str(ctype)
+
+
+def _browser_proxy_response(flow) -> Response:
+    raw = _query_first(flow, "url", "u", default="")
+    norm = _normalize_browser_target(raw)
+    if not norm:
+        return _error_page("无效网址。示例：https://www.bilibili.com", status=400)
+    target_url, _token = norm
+    try:
+        body, ctype = _browser_fetch_url(target_url)
+    except Exception as e:  # noqa: BLE001
+        err = (
+            f"<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport "
+            f'content="width=device-width,initial-scale=1"><title>加载失败</title></head>'
+            f'<body style="font-family:sans-serif;padding:20px;background:#1a1a2e;color:#eee">'
+            f"<h2>无法加载页面</h2><p>{html.escape(str(e))}</p>"
+            f'<p><a href="/browser">返回浏览器</a></p></body></html>'
+        )
+        return _html_response(err.encode("utf-8"), status=502)
+    headers = {"Cache-Control": "no-store", "X-Frame-Options": "SAMEORIGIN"}
+    low_ct = (ctype or "").lower()
+    if "text/html" in low_ct or body[:256].lstrip().startswith(b"<"):
+        try:
+            text = body.decode("utf-8", errors="replace")
+            body = _browser_rewrite_html(text, target_url).encode("utf-8")
+            headers["Content-Type"] = "text/html; charset=utf-8"
+        except (UnicodeDecodeError, ValueError):
+            headers["Content-Type"] = ctype or "text/html; charset=utf-8"
+    else:
+        headers["Content-Type"] = ctype
+    return Response.make(200, body, headers)
+
+
+def _browser_allow_response(flow) -> Response:
+    raw = _query_first(flow, "url", "u", default="")
+    norm = _normalize_browser_target(raw)
+    if not norm:
+        pl = json.dumps({"ok": False, "error": "invalid_url"}, ensure_ascii=False)
+        return Response.make(400, pl.encode("utf-8"), {"Content-Type": "application/json; charset=utf-8"})
+    target_url, token = norm
+    _browser_bypass_add(token)
+    try:
+        h = (urlparse(target_url).hostname or "").lower()
+        if h:
+            _browser_bypass_add(h)
+    except (TypeError, ValueError):
+        pass
+    pl = json.dumps({"ok": True, "url": target_url}, ensure_ascii=False)
+    return Response.make(200, pl.encode("utf-8"), {"Content-Type": "application/json; charset=utf-8"})
+
+
+def _browse_web_response(flow) -> Response:
+    return Response.make(303, b"", {"Location": "/browser", "Cache-Control": "no-store"})
+
+
+def _browser_shell_html() -> str:
+    p = _BASE / "assets" / "browser_shell.html"
+    try:
+        return p.read_text(encoding="utf-8")
+    except OSError:
+        return "<p>缺少 assets/browser_shell.html</p>"
+
+
+def _browser_page_response(flow) -> Response:
+    start_url = (_query_first(flow, "url", default="") or "").strip()
+    start_js = json.dumps(start_url)
+    body = _browser_shell_html().replace("/*START_URL*/", start_js)
+    return _html_response(
+        _shell("浏览器", body, raw=True, mini_player=False, show_splash_fab=True)
+    )
 
 
 def _dispatch_open(flow, path: Path) -> Response:
@@ -6869,6 +6911,12 @@ def _route(flow) -> Response:
             return _dispatch_open(flow, p)
         if path == "/browse":
             return _browse_response(flow)
+        if path == "/browser":
+            return _browser_page_response(flow)
+        if path == "/browser/allow":
+            return _browser_allow_response(flow)
+        if path.startswith("/browser/proxy"):
+            return _browser_proxy_response(flow)
         if path == "/browse_web":
             return _browse_web_response(flow)
         # 兜底：首页
