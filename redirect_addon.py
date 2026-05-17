@@ -7473,6 +7473,29 @@ def _route(flow) -> Response:
 # mitmproxy 入口
 # ---------------------------------------------------------------------------
 
+def _mitm_listen_port() -> int:
+    """读取当前 mitmdump 的监听端口；默认 2345。"""
+    raw = (os.environ.get("MC_LISTEN_PORT", "") or "2345").strip()
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 2345
+
+
+def _is_self_request(flow) -> bool:
+    """请求是否真的指向 VerPadProxy 本机（host:port 命中 listen 端口）？
+
+    Pad 通过 HTTP 代理时：
+    - 访问 VerPadProxy 自己（如 http://192.168.1.7:2345/browser）→ Host 头是手机 IP:2345
+    - 访问外站（如 http://example.com/） → Host 头是 example.com
+    只在前者时进入 _route 改写；后者一律透传，避免外站请求被 _route 兜底成首页。"""
+    try:
+        _h, port = _request_host_port(flow)
+        return port == _mitm_listen_port()
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def request(flow) -> None:
     if flow.request.method.upper() == "CONNECT":
         return
@@ -7485,6 +7508,12 @@ def request(flow) -> None:
         return
     # 浏览器直跳：命中白名单则跳过改写，让 mitmproxy 默认转发到真实上游
     if _is_browser_bypass(flow):
+        return
+    # 关键：只有 host:port 真的指向 VerPadProxy 本机时才改写。
+    # 否则就是 Pad 浏览器（无论是内置浏览器渲染出的页面里 JS 跳转、
+    # 还是用户直接输入网址）想访问外站，全部透传到真实上游。
+    # 这能避免 _route 兜底把外站请求变成 VerPadProxy 首页 → "跳首页" 假象。
+    if not _is_self_request(flow):
         return
     flow.response = _route(flow)
 
