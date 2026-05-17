@@ -6448,22 +6448,24 @@ html.vp-browser body{padding-top:54px!important;margin-top:0!important}
 <script>(function(){
   document.documentElement.classList.add('vp-browser');
   var ORG = location.origin;
-  function go(raw){
+  function postTo(action, raw){
     if(!raw) return;
-    location.href = ORG + '/browser/go?url=' + encodeURIComponent(raw);
-  }
-  function direct(raw){
-    if(!raw) return;
-    location.href = ORG + '/browser/direct?url=' + encodeURIComponent(raw);
+    var f = document.createElement('form');
+    f.method = 'post'; f.action = ORG + action;
+    var i = document.createElement('input');
+    i.type = 'hidden'; i.name = 'url'; i.value = raw;
+    f.appendChild(i);
+    document.body.appendChild(f);
+    f.submit();
   }
   document.getElementById('vp-home').onclick = function(){ location.href = ORG + '/'; };
   document.getElementById('vp-back').onclick = function(){ history.back(); };
   document.getElementById('vp-fwd').onclick = function(){ history.forward(); };
   document.getElementById('vp-reload').onclick = function(){ location.reload(); };
   var input = document.getElementById('vp-url');
-  document.getElementById('vp-go').onclick = function(){ go(input.value); };
-  document.getElementById('vp-direct').onclick = function(){ direct(input.value); };
-  input.addEventListener('keydown', function(e){ if(e.key === 'Enter'){ e.preventDefault(); go(input.value); } });
+  document.getElementById('vp-go').onclick = function(){ postTo('/browser/go', input.value); };
+  document.getElementById('vp-direct').onclick = function(){ postTo('/browser/direct', input.value); };
+  input.addEventListener('keydown', function(e){ if(e.key === 'Enter'){ e.preventDefault(); postTo('/browser/go', input.value); } });
 })();</script>
 """
 
@@ -6682,6 +6684,15 @@ def _normalize_browser_target(raw: str) -> tuple[str, str] | None:
 
 
 def _browser_proxify_url(abs_url: str) -> str:
+    """生成代理 URL；启用混淆时返回 /browser/proxy?u=gAAAAA...（不含 bilibili.com 等关键词）。
+
+    受限平板（如 ForClass app）会对 URL 做关键词黑名单过滤，
+    URL 里出现 bilibili.com / hdslb.com 等就直接被拦到 unauth.html。
+    用 Fernet 加密成不可读 token 后，黑名单看不到任何域名字面值。"""
+    if _URL_OBFUSCATE:
+        tok = _obfuscate(abs_url)
+        if tok and tok.startswith("gAAAAA"):
+            return "/browser/proxy?u=" + tok
     return "/browser/proxy?url=" + quote(abs_url, safe="")
 
 
@@ -6953,7 +6964,12 @@ def _browser_fetch_url(url: str, user: str = "") -> tuple[bytes, str, str]:
 
 
 def _browser_proxy_response(flow) -> Response:
-    raw = _query_first(flow, "url", "u", default="")
+    # 优先看加密 token u；fallback 看明文 url（向后兼容）。
+    raw = _query_first(flow, "u", default="")
+    if raw:
+        raw = _unobfuscate(raw) or raw
+    if not raw:
+        raw = _query_first(flow, "url", default="")
     norm = _normalize_browser_target(raw)
     if not norm:
         return _error_page("无效网址。示例：https://www.bilibili.com", status=400)
@@ -7025,8 +7041,25 @@ def _browser_proxy_response(flow) -> Response:
 
 
 def _browser_go_response(flow) -> Response:
-    """表单提交后的中转：把 raw URL 规范化 → 303 到 /browser/proxy。"""
-    raw = _query_first(flow, "url", "u", default="")
+    """表单提交后的中转：把 raw URL 规范化 → 303 到 /browser/proxy?u=<token>。
+
+    优先接受 POST body 提交（body 不在 URL 上，ForClass 黑名单看不到）。
+    GET query 作为 fallback。"""
+    raw = ""
+    if flow.request.method.upper() == "POST":
+        try:
+            ct = (flow.request.headers.get("Content-Type") or "").lower()
+            if "application/x-www-form-urlencoded" in ct:
+                body = flow.request.get_text() or ""
+                qs = parse_qs(body, keep_blank_values=True)
+                raw = (qs.get("url") or qs.get("u") or [""])[0]
+        except (UnicodeDecodeError, ValueError):
+            pass
+    if not raw:
+        raw = _query_first(flow, "url", "u", default="")
+    # 兼容直接收到加密 token
+    if raw and not raw.startswith(("http://", "https://")) and raw.startswith("gAAAAA"):
+        raw = _unobfuscate(raw) or raw
     norm = _normalize_browser_target(raw)
     if not norm:
         return Response.make(303, b"",
@@ -7042,8 +7075,20 @@ def _browser_direct_response(flow) -> Response:
 
     Pad 浏览器后续对该 host 的 HTTP/HTTPS 请求会被 mitmproxy 原样转发，
     效果等同于"不走代理改写、直接访问网站"。HTTPS 走 CONNECT 隧道，
-    Pad 看到的是目标站真实证书，无需装 CA。"""
-    raw = _query_first(flow, "url", "u", default="")
+    Pad 看到的是目标站真实证书，无需装 CA。
+    注意：直连模式 URL 必然含真实域名，受限平板黑名单仍可能拦截。"""
+    raw = ""
+    if flow.request.method.upper() == "POST":
+        try:
+            ct = (flow.request.headers.get("Content-Type") or "").lower()
+            if "application/x-www-form-urlencoded" in ct:
+                body = flow.request.get_text() or ""
+                qs = parse_qs(body, keep_blank_values=True)
+                raw = (qs.get("url") or qs.get("u") or [""])[0]
+        except (UnicodeDecodeError, ValueError):
+            pass
+    if not raw:
+        raw = _query_first(flow, "url", "u", default="")
     norm = _normalize_browser_target(raw)
     if not norm:
         return Response.make(303, b"",
@@ -7127,27 +7172,31 @@ def _browser_page_response(flow) -> Response:
   </div>
 </div>
 <script>(function(){{
-  // 起始页跳转：用 location.href 走 JS，绝不依赖 form submit，
-  // 避免被 _shell 注入的退出 fab / mitm-trap JS（addEventListener click/submit）吞事件。
+  // 起始页跳转：用动态 POST 表单提交，让网址不暴露在 URL 上，
+  // 绕开 ForClass 这类受限平板对 URL 关键词黑名单的过滤。
+  // 后端 /browser/go 接受 POST body，规范化后 303 到 /browser/proxy?u=<加密token>
+  // 整个流程中 URL 上只有 base64 token，不出现 bilibili.com 等关键词。
   var input = document.getElementById('vp-start-url');
-  function go(){{
+  function submitPost(action){{
     var v = (input.value || '').trim();
     if(!v) return;
-    location.href = '/browser/go?url=' + encodeURIComponent(v);
-  }}
-  function direct(){{
-    var v = (input.value || '').trim();
-    if(!v) return;
-    location.href = '/browser/direct?url=' + encodeURIComponent(v);
+    var f = document.createElement('form');
+    f.method = 'post';
+    f.action = action;
+    var i = document.createElement('input');
+    i.type = 'hidden'; i.name = 'url'; i.value = v;
+    f.appendChild(i);
+    document.body.appendChild(f);
+    f.submit();
   }}
   document.getElementById('vp-start-go').addEventListener('click', function(e){{
-    e.preventDefault(); e.stopPropagation(); go();
+    e.preventDefault(); e.stopPropagation(); submitPost('/browser/go');
   }}, true);
   document.getElementById('vp-start-direct').addEventListener('click', function(e){{
-    e.preventDefault(); e.stopPropagation(); direct();
+    e.preventDefault(); e.stopPropagation(); submitPost('/browser/direct');
   }}, true);
   input.addEventListener('keydown', function(e){{
-    if(e.key === 'Enter' || e.keyCode === 13){{ e.preventDefault(); go(); }}
+    if(e.key === 'Enter' || e.keyCode === 13){{ e.preventDefault(); submitPost('/browser/go'); }}
   }}, true);
 }})();</script>"""
     # 起始页不要 splash fab / mini player / exit telemetry，避免它们的全局 click/submit 拦截
