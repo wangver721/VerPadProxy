@@ -16,6 +16,13 @@ hotspot_display.html
 mitm_logs/
 payload/*
 !payload/.gitkeep
+
+# 临时 commit 草稿 / 调试脚本
+_commit_msg.txt
+_inspect.sh
+_test_fetch.py
+_cleanup_phone.sh
+_tmp_*.sh
 !payload/*/
 !payload/*/.gitkeep
 /data/
