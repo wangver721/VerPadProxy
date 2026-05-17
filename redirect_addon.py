@@ -6413,6 +6413,111 @@ _HREF_SRC_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 顶部 sticky 地址栏 chrome（注入到代理页面 <body> 开头）
+_BROWSER_CHROME_HTML = r"""
+<style id="vp-bchrome-style">
+#vp-bchrome{position:fixed;top:0;left:0;right:0;z-index:2147483647;
+  display:flex;gap:6px;align-items:center;padding:8px 10px;
+  background:rgba(18,22,34,.96);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+  border-bottom:1px solid rgba(255,255,255,.18);
+  font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;font-size:13px;color:#eaf0ff;
+  box-shadow:0 2px 12px rgba(0,0,0,.35)}
+#vp-bchrome a,#vp-bchrome button{background:rgba(255,255,255,.08);color:#eaf0ff;
+  border:1px solid rgba(255,255,255,.16);border-radius:8px;min-width:38px;min-height:36px;
+  padding:0 10px;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;
+  cursor:pointer;font-size:14px;line-height:1;box-sizing:border-box}
+#vp-bchrome a:hover,#vp-bchrome button:hover{background:rgba(255,255,255,.16)}
+#vp-bchrome form{flex:1;display:flex;gap:6px;margin:0;min-width:0}
+#vp-bchrome input{flex:1;min-width:0;padding:8px 10px;border-radius:8px;
+  background:rgba(0,0,0,.45);color:#fff;border:1px solid rgba(255,255,255,.18);font-size:13px}
+#vp-bchrome .vp-go{background:linear-gradient(135deg,#5fa1ff,#b97cff);color:#fff;font-weight:700;border-color:transparent}
+html.vp-browser{margin-top:0}
+html.vp-browser body{padding-top:54px!important;margin-top:0!important}
+</style>
+<div id="vp-bchrome" data-noproxy="1">
+  <a href="/" title="VerPadProxy 首页">🏠</a>
+  <button type="button" onclick="history.back()" title="后退">◀</button>
+  <button type="button" onclick="history.forward()" title="前进">▶</button>
+  <button type="button" onclick="location.reload()" title="刷新">↻</button>
+  <form action="/browser/go" method="get">
+    <input name="url" value="__VP_CUR_URL__" type="text" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="输入网址">
+    <button class="vp-go" type="submit">前往</button>
+  </form>
+</div>
+<script>document.documentElement.classList.add('vp-browser');</script>
+"""
+
+# 注入到 <head> 开头的运行时拦截：fetch / XHR / window.open / form / 动态创建的 a
+_BROWSER_RUNTIME_JS = r"""
+<script>(function(){
+  var PAGE = __VP_PAGE_URL__;
+  function abs(u){ try{ return new URL(u, PAGE).href; }catch(e){ return u; } }
+  function isHttp(u){ return /^https?:/i.test(u); }
+  function isOurs(u){ return /^\/browser\/proxy/.test(u); }
+  function proxify(u){
+    if(!u) return u;
+    if(typeof u !== 'string') return u;
+    if(isOurs(u)) return u;
+    if(u.startsWith('javascript:')||u.startsWith('mailto:')||u.startsWith('tel:')||u.startsWith('data:')||u.startsWith('blob:')||u.startsWith('about:')||u.startsWith('#')) return u;
+    var a = abs(u);
+    if(!isHttp(a)) return u;
+    return '/browser/proxy?url=' + encodeURIComponent(a);
+  }
+  // fetch
+  try{
+    var _f = window.fetch;
+    if(_f){
+      window.fetch = function(input, init){
+        try{
+          if(typeof input === 'string') input = proxify(input);
+          else if(input && input.url){ input = new Request(proxify(input.url), input); }
+        }catch(e){}
+        return _f.call(this, input, init);
+      };
+    }
+  }catch(e){}
+  // XHR
+  try{
+    var _open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url){
+      arguments[1] = proxify(url);
+      return _open.apply(this, arguments);
+    };
+  }catch(e){}
+  // window.open
+  try{
+    var _open2 = window.open;
+    window.open = function(url, name, feat){
+      return _open2.call(this, url ? proxify(url) : url, name, feat);
+    };
+  }catch(e){}
+  // 表单 submit
+  document.addEventListener('submit', function(ev){
+    var f = ev.target;
+    if(!f || !f.action) return;
+    try{
+      if(!isOurs(f.action) && isHttp(abs(f.action))){
+        f.action = proxify(f.action);
+      }
+    }catch(e){}
+  }, true);
+  // 点击：动态生成的 a 也兜底
+  document.addEventListener('click', function(ev){
+    var a = ev.target && ev.target.closest && ev.target.closest('a');
+    if(!a) return;
+    var h = a.getAttribute('href');
+    if(!h) return;
+    if(isOurs(h)) return;
+    if(a.closest('#vp-bchrome')) return;
+    if(h.startsWith('javascript:')||h.startsWith('mailto:')||h.startsWith('tel:')||h.startsWith('#')) return;
+    ev.preventDefault();
+    var u = proxify(h);
+    if(a.target === '_blank') window.open(u, '_blank');
+    else location.href = u;
+  }, true);
+})();</script>
+"""
+
 
 def _normalize_browser_target(raw: str) -> tuple[str, str] | None:
     """把用户输入的"网址"清洗为 (跳转 URL, 写入白名单的 host_token)。
@@ -6461,54 +6566,204 @@ def _browser_proxify_url(abs_url: str) -> str:
     return "/browser/proxy?url=" + quote(abs_url, safe="")
 
 
+# 提取上游 Content-Type 里的 charset；找不到默认 utf-8
+_CHARSET_RE = re.compile(r"charset\s*=\s*([A-Za-z0-9_\-]+)", re.IGNORECASE)
+# 在 HTML <meta http-equiv="Content-Type" content="text/html; charset=xxx"> 里嗅探编码
+_META_CHARSET_RE = re.compile(
+    rb'''<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9_\-]+)''', re.IGNORECASE,
+)
+
+
+def _sniff_html_charset(ctype: str, body: bytes) -> str:
+    m = _CHARSET_RE.search(ctype or "")
+    if m:
+        return m.group(1).lower()
+    m2 = _META_CHARSET_RE.search(body[:4096])
+    if m2:
+        try:
+            return m2.group(1).decode("ascii", errors="replace").lower()
+        except UnicodeDecodeError:
+            pass
+    return "utf-8"
+
+
+# 改写 href / src / action / poster / data-src / srcset
+_REWRITE_ATTR_RE = re.compile(
+    r'(?P<attr>href|src|action|poster|data-src|data-href|formaction)\s*=\s*'
+    r'(?P<q>["\'])(?P<val>(?:(?!(?P=q)).)*)(?P=q)',
+    re.IGNORECASE,
+)
+# 单独处理 srcset：内部多个 "URL 1x, URL 2x"
+_SRCSET_RE = re.compile(
+    r'(?P<attr>srcset)\s*=\s*(?P<q>["\'])(?P<val>(?:(?!(?P=q)).)*)(?P=q)',
+    re.IGNORECASE,
+)
+
+
 def _browser_rewrite_html(html_text: str, page_url: str) -> str:
-    def _fix_val(val: str) -> str:
-        v = (val or "").strip()
+    """把页面里的链接 / 表单 / 资源、以及 fetch/XHR/window.open 全部劫持到代理。"""
+
+    # 1) 干掉 <base href="..."> —— 不然相对路径会跑偏
+    html_text = re.sub(r"<base\b[^>]*>", "", html_text, flags=re.IGNORECASE)
+
+    # 2) 干掉响应里的 CSP meta（会阻止 inline 注入脚本）
+    html_text = re.sub(
+        r'<meta[^>]+http-equiv\s*=\s*["\']?\s*content-security-policy[^>]*>',
+        "", html_text, flags=re.IGNORECASE,
+    )
+
+    def _fix_one(v: str) -> str:
+        v = (v or "").strip()
         if not v or v.startswith("#"):
             return v
         low = v.lower()
-        if low.startswith(("javascript:", "mailto:", "data:", "blob:")):
+        if low.startswith(("javascript:", "mailto:", "tel:", "data:", "blob:", "about:")):
             return v
-        abs_u = urljoin(page_url, v)
+        try:
+            abs_u = urljoin(page_url, v)
+        except (TypeError, ValueError):
+            return v
         if abs_u.startswith(("http://", "https://")):
             return _browser_proxify_url(abs_u)
         return v
 
-    def _repl(m: re.Match[str]) -> str:
-        nv = _fix_val(m.group("val"))
+    def _repl_attr(m: re.Match[str]) -> str:
+        nv = _fix_one(m.group("val"))
         return f'{m.group("attr")}={m.group("q")}{nv}{m.group("q")}'
 
-    out = _HREF_SRC_RE.sub(_repl, html_text)
-    inject = (
-        '<meta name="referrer" content="no-referrer">'
-        '<script>(function(){document.addEventListener("click",function(e){'
-        'var a=e.target.closest("a");if(!a||!a.href)return;'
-        'if(a.href.indexOf("/browser/proxy")===0){e.preventDefault();'
-        'parent.postMessage({t:"nav",u:a.href},"*");}},true);})();</script>'
-    )
-    if re.search(r"</head>", out, re.IGNORECASE):
-        out = re.sub(r"</head>", inject + "</head>", out, count=1, flags=re.IGNORECASE)
+    def _repl_srcset(m: re.Match[str]) -> str:
+        raw = m.group("val")
+        out_items: list[str] = []
+        for item in raw.split(","):
+            it = item.strip()
+            if not it:
+                continue
+            parts = it.split(None, 1)
+            url0 = parts[0]
+            desc = (" " + parts[1]) if len(parts) > 1 else ""
+            out_items.append(_fix_one(url0) + desc)
+        return f'{m.group("attr")}={m.group("q")}{", ".join(out_items)}{m.group("q")}'
+
+    out = _REWRITE_ATTR_RE.sub(_repl_attr, html_text)
+    out = _SRCSET_RE.sub(_repl_srcset, out)
+
+    # 3) 顶部注入：sticky 地址栏 chrome + JS 拦截
+    chrome = _BROWSER_CHROME_HTML.replace("__VP_CUR_URL__", html.escape(page_url, quote=True))
+    # 把 chrome 放在 <body> 后面；找不到 body 就直接 prepend
+    if re.search(r"<body[^>]*>", out, re.IGNORECASE):
+        out = re.sub(r"(<body[^>]*>)", r"\1" + chrome, out, count=1, flags=re.IGNORECASE)
     else:
-        out = inject + out
+        out = chrome + out
+
+    # 4) 在 <head> 里注入：base + referrer + 运行时 fetch/XHR/window.open 拦截
+    head_inject = (
+        f'<base href="{html.escape(page_url, quote=True)}">'
+        '<meta name="referrer" content="no-referrer">'
+        '<style>html,body{margin-top:0!important}</style>'
+        + _BROWSER_RUNTIME_JS.replace("__VP_PAGE_URL__", json.dumps(page_url))
+    )
+    if re.search(r"<head[^>]*>", out, re.IGNORECASE):
+        out = re.sub(r"(<head[^>]*>)", r"\1" + head_inject, out, count=1, flags=re.IGNORECASE)
+    elif re.search(r"<html[^>]*>", out, re.IGNORECASE):
+        out = re.sub(r"(<html[^>]*>)", r"\1<head>" + head_inject + "</head>", out, count=1, flags=re.IGNORECASE)
+    else:
+        out = "<head>" + head_inject + "</head>" + out
+
     return out
 
 
-def _browser_fetch_url(url: str) -> tuple[bytes, str]:
-    req = Request(
-        url,
-        headers={
-            "User-Agent": _BROWSER_UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        },
-        method="GET",
-    )
-    with urlopen(req, timeout=_BROWSER_FETCH_TIMEOUT) as resp:
-        body = resp.read(_BROWSER_MAX_BYTES + 1)
-        if len(body) > _BROWSER_MAX_BYTES:
-            body = body[:_BROWSER_MAX_BYTES]
-        ctype = resp.headers.get("Content-Type", "") or "application/octet-stream"
-        return body, str(ctype)
+def _browser_fetch_url(url: str) -> tuple[bytes, str, str]:
+    """抓取页面；返回 (body, content-type, 最终 URL)。
+
+    优先用 curl（Termux 上 Python urllib 在 IPv6+TLS 路径下会卡几十秒），
+    没有 curl 才回退到 urllib。"""
+    curl = _which("curl")
+    if curl:
+        # 头响应分隔输出：先 -i 拿到 header+body 一起，再 split
+        try:
+            cmd = [
+                curl, "-sSL", "-4",                # 强制 IPv4，绕开 IPv6 卡死
+                "-i",                              # 输出 header
+                "--max-time", str(_BROWSER_FETCH_TIMEOUT),
+                "--max-filesize", str(_BROWSER_MAX_BYTES),
+                "-A", _BROWSER_UA,
+                "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "-H", "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
+                "-H", "Accept-Encoding: identity",
+                "-w", "\n__VP_URL_EFFECTIVE__=%{url_effective}\n",
+                url,
+            ]
+            r = subprocess.run(
+                cmd, capture_output=True, timeout=_BROWSER_FETCH_TIMEOUT + 4, check=False,
+            )
+            raw = r.stdout or b""
+            # 拆 header / body
+            # 跟随重定向时会有多段 header，取最后一段 \r\n\r\n 之后到 __VP_URL_EFFECTIVE__ 之前
+            tail_marker = b"\n__VP_URL_EFFECTIVE__="
+            final_url = url
+            if tail_marker in raw:
+                idx_tail = raw.rfind(tail_marker)
+                tail = raw[idx_tail + len(tail_marker):].splitlines()[0].strip()
+                try:
+                    final_url = tail.decode("ascii", errors="replace") or url
+                except UnicodeDecodeError:
+                    pass
+                raw = raw[:idx_tail]
+            # 最后一对 header/body 分隔
+            sep = b"\r\n\r\n"
+            split_pos = raw.rfind(sep)
+            ctype = "application/octet-stream"
+            body = raw
+            if split_pos >= 0:
+                head_bytes = raw[:split_pos]
+                body = raw[split_pos + len(sep):]
+                # 在最后一段 header 里找 Content-Type
+                last_block = head_bytes.rsplit(b"\r\n\r\n", 1)[-1]
+                for line in last_block.split(b"\r\n"):
+                    if line[:13].lower() == b"content-type:":
+                        try:
+                            ctype = line[13:].decode("ascii", errors="replace").strip() or ctype
+                        except UnicodeDecodeError:
+                            pass
+                        break
+            if len(body) > _BROWSER_MAX_BYTES:
+                body = body[:_BROWSER_MAX_BYTES]
+            if r.returncode == 0 and body:
+                return body, ctype, final_url
+            # curl 出错也走 urllib 回退一下
+            err_tail = (r.stderr or b"").decode("utf-8", errors="replace")[-300:]
+            raise OSError(f"curl rc={r.returncode}: {err_tail.strip() or '空响应'}")
+        except subprocess.TimeoutExpired as e:
+            raise OSError(f"curl 抓取超时（{_BROWSER_FETCH_TIMEOUT}s）") from e
+
+    # 没 curl → 原生 urllib（顺带强制 IPv4）
+    import socket as _sock
+    _orig_gai = _sock.getaddrinfo
+
+    def _gai_v4_only(host, port, family=0, *a, **kw):
+        return _orig_gai(host, port, _sock.AF_INET, *a, **kw)
+
+    _sock.getaddrinfo = _gai_v4_only  # type: ignore[assignment]
+    try:
+        req = Request(
+            url,
+            headers={
+                "User-Agent": _BROWSER_UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "identity",
+            },
+            method="GET",
+        )
+        with urlopen(req, timeout=_BROWSER_FETCH_TIMEOUT) as resp:
+            body = resp.read(_BROWSER_MAX_BYTES + 1)
+            if len(body) > _BROWSER_MAX_BYTES:
+                body = body[:_BROWSER_MAX_BYTES]
+            ctype = resp.headers.get("Content-Type", "") or "application/octet-stream"
+            final_url = resp.geturl() or url
+            return body, str(ctype), str(final_url)
+    finally:
+        _sock.getaddrinfo = _orig_gai  # type: ignore[assignment]
 
 
 def _browser_proxy_response(flow) -> Response:
@@ -6518,28 +6773,53 @@ def _browser_proxy_response(flow) -> Response:
         return _error_page("无效网址。示例：https://www.bilibili.com", status=400)
     target_url, _token = norm
     try:
-        body, ctype = _browser_fetch_url(target_url)
+        body, ctype, target_url = _browser_fetch_url(target_url)
     except Exception as e:  # noqa: BLE001
+        msg = html.escape(str(e))
         err = (
-            f"<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport "
-            f'content="width=device-width,initial-scale=1"><title>加载失败</title></head>'
-            f'<body style="font-family:sans-serif;padding:20px;background:#1a1a2e;color:#eee">'
-            f"<h2>无法加载页面</h2><p>{html.escape(str(e))}</p>"
-            f'<p><a href="/browser">返回浏览器</a></p></body></html>'
+            f'<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" '
+            f'content="width=device-width,initial-scale=1"><title>加载失败</title>'
+            f'<style>body{{font-family:-apple-system,Segoe UI,Arial;background:#1a1a2e;color:#eee;padding:24px;line-height:1.7}}'
+            f'a{{color:#7ec1ff}} .url{{word-break:break-all;color:#a4d3ff}}</style></head>'
+            f'<body><h2>⚠ 无法加载</h2><p>{msg}</p>'
+            f'<p class="url">{html.escape(target_url)}</p>'
+            f'<p><a href="/browser">返回起始页</a> · '
+            f'<a href="{_browser_proxify_url(target_url)}">重试</a></p></body></html>'
         )
         return _html_response(err.encode("utf-8"), status=502)
-    headers = {"Cache-Control": "no-store", "X-Frame-Options": "SAMEORIGIN"}
+
+    # 剥掉妨碍嵌入/改写的响应头（我们只放本机的）
+    headers = {
+        "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer",
+    }
     low_ct = (ctype or "").lower()
-    if "text/html" in low_ct or body[:256].lstrip().startswith(b"<"):
+    is_html = ("text/html" in low_ct) or ("application/xhtml" in low_ct) or body[:256].lstrip().startswith(b"<!")
+    if is_html:
+        cs = _sniff_html_charset(ctype, body)
         try:
+            text = body.decode(cs, errors="replace")
+        except (LookupError, UnicodeDecodeError):
             text = body.decode("utf-8", errors="replace")
-            body = _browser_rewrite_html(text, target_url).encode("utf-8")
-            headers["Content-Type"] = "text/html; charset=utf-8"
-        except (UnicodeDecodeError, ValueError):
-            headers["Content-Type"] = ctype or "text/html; charset=utf-8"
+        text = _browser_rewrite_html(text, target_url)
+        body = text.encode("utf-8")
+        headers["Content-Type"] = "text/html; charset=utf-8"
     else:
         headers["Content-Type"] = ctype
     return Response.make(200, body, headers)
+
+
+def _browser_go_response(flow) -> Response:
+    """表单提交后的中转：把 raw URL 规范化 → 303 到 /browser/proxy。"""
+    raw = _query_first(flow, "url", "u", default="")
+    norm = _normalize_browser_target(raw)
+    if not norm:
+        return Response.make(303, b"",
+                             {"Location": "/browser?err=1", "Cache-Control": "no-store"})
+    target_url, _ = norm
+    return Response.make(303, b"",
+                         {"Location": _browser_proxify_url(target_url),
+                          "Cache-Control": "no-store"})
 
 
 def _browser_allow_response(flow) -> Response:
@@ -6564,21 +6844,62 @@ def _browse_web_response(flow) -> Response:
     return Response.make(303, b"", {"Location": "/browser", "Cache-Control": "no-store"})
 
 
-def _browser_shell_html() -> str:
-    p = _BASE / "assets" / "browser_shell.html"
-    try:
-        return p.read_text(encoding="utf-8")
-    except OSError:
-        return "<p>缺少 assets/browser_shell.html</p>"
-
-
 def _browser_page_response(flow) -> Response:
+    """起始页：地址栏 + 一键直达常用站点。提交后 303 → /browser/proxy。"""
     start_url = (_query_first(flow, "url", default="") or "").strip()
-    start_js = json.dumps(start_url)
-    body = _browser_shell_html().replace("/*START_URL*/", start_js)
-    return _html_response(
-        _shell("浏览器", body, raw=True, mini_player=False, show_splash_fab=True)
+    err = (_query_first(flow, "err", default="") or "").strip()
+    # 用户上来就带了 ?url=xxx，直接进代理
+    if start_url:
+        norm = _normalize_browser_target(start_url)
+        if norm:
+            return Response.make(303, b"",
+                                 {"Location": _browser_proxify_url(norm[0]),
+                                  "Cache-Control": "no-store"})
+    notice = ('<div class="card" style="border-color:rgba(255,180,124,.4);color:#ffd9b5;margin-bottom:12px">'
+              '网址无效，请重新输入。</div>') if err else ""
+    quick: list[tuple[str, str]] = [
+        ("https://www.bilibili.com", "B 站"),
+        ("https://www.baidu.com", "百度"),
+        ("https://www.zhihu.com", "知乎"),
+        ("https://www.bing.com", "Bing"),
+        ("https://github.com", "GitHub"),
+    ]
+    chips = "".join(
+        f'<a class="btn btn-ghost btn-sm" href="{_browser_proxify_url(u)}">{html.escape(t)}</a>'
+        for u, t in quick
     )
+    body = f"""
+<div class="topbar">
+  <a class="btn btn-ghost btn-sm" href="/">🏠</a>
+  <span class="brand">浏览器</span>
+  <span class="spacer"></span>
+</div>
+<div class="content">
+  {notice}
+  <div class="card">
+    <form method="get" action="/browser/go">
+      <p class="muted" style="margin-top:0">由手机联网代拉网页再转发给 Pad；点链接会自动经过同样的代理。</p>
+      <input class="input" type="text" name="url" required autofocus
+             inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+             placeholder="如 bilibili.com 或 https://example.com/path" style="width:100%">
+      <div class="row" style="margin-top:12px;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-primary" type="submit">前往</button>
+        <a class="btn btn-ghost" href="/">取消</a>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <div class="muted" style="margin-bottom:8px">快捷直达</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">{chips}</div>
+  </div>
+  <div class="card">
+    <p class="muted" style="margin:0;font-size:.86rem;line-height:1.7">
+      <strong>提示</strong>：浏览器仅供合规自用场景。复杂前端站点（B 站等）受 JS 动态加载限制，
+      简单内容（搜索结果、文章、文档站、内网管理面板）体验最佳。
+    </p>
+  </div>
+</div>"""
+    return _html_response(_shell("浏览器", body))
 
 
 def _dispatch_open(flow, path: Path) -> Response:
@@ -6913,6 +7234,8 @@ def _route(flow) -> Response:
             return _browse_response(flow)
         if path == "/browser":
             return _browser_page_response(flow)
+        if path == "/browser/go":
+            return _browser_go_response(flow)
         if path == "/browser/allow":
             return _browser_allow_response(flow)
         if path.startswith("/browser/proxy"):
