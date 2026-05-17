@@ -6830,10 +6830,16 @@ def _browser_rewrite_html(html_text: str, page_url: str) -> str:
     else:
         out = chrome + out
 
-    # 4) 在 <head> 里注入：base href + referrer + 运行时 fetch/XHR/window.open 拦截
+    # 4) 在 <head> 里注入：referrer + 运行时 fetch/XHR/window.open 拦截
+    # 关键决策：**不注入 <base href>**。
+    # 注入 base 会让 JS 内相对路径解析到 https://m.bilibili.com/，
+    # Pad 浏览器渲染时发请求 https://m.bilibili.com/x.css → 受限平板 ForClass
+    # app 看到 URL host 是 bilibili.com 立刻拦截到 unauth.html。
+    # 不注入 base → 相对路径解析到 mitmproxy origin（http://zzn.forclass.net）
+    # → Pad 永远只请求自己代理的 origin，关键词全在加密 token 里
+    # → 兜底逻辑通过 Referer 反推原始外站 URL 重新代理 fetch。
     head_inject = (
-        f'<base href="{html.escape(page_url, quote=True)}">'
-        '<meta name="referrer" content="no-referrer">'
+        '<meta name="referrer" content="same-origin">'
         '<style>html,body{margin-top:0!important}</style>'
         + _BROWSER_RUNTIME_JS.replace("__VP_PAGE_URL__", json.dumps(page_url))
     )
@@ -6974,16 +6980,10 @@ def _browser_proxy_response(flow) -> Response:
     if not norm:
         return _error_page("无效网址。示例：https://www.bilibili.com", status=400)
     target_url, token = norm
-    # 关键：把目标 host 自动加入透传白名单。
-    # 这样 SPA 内 JS 通过 location.href 跳到同站其它 URL 时，
-    # mitmproxy 看到 host 在白名单 → 不进 _route，避免兜底回 VerPadProxy 首页。
-    _browser_bypass_add(token)
-    try:
-        host_only = (urlparse(target_url).hostname or "").lower()
-        if host_only:
-            _browser_bypass_add(host_only)
-    except (TypeError, ValueError):
-        pass
+    # 不再自动 bypass — 在受限平板（ForClass 黑名单）场景下，
+    # bypass 会让 Pad 直连外站 host，URL 露出 bilibili.com 立刻被拦。
+    # 让所有请求只走 mitmproxy origin（zzn.forclass.net），
+    # 由 _browser_referer_fallback 通过 Referer 反推处理子资源。
     # 多用户隔离：取当前账号名作为 cookie jar 维度
     try:
         ctx_user = user_auth.get_user_ctx_from_flow(flow)
@@ -7038,6 +7038,91 @@ def _browser_proxy_response(flow) -> Response:
         else:
             headers["Cache-Control"] = "no-store"
     return Response.make(200, body, headers)
+
+
+def _browser_referer_fallback(flow):
+    """如果当前请求是 Pad 代理浏览页面里相对路径加载的子资源，
+    Referer 头会指向 /browser/proxy?u=token。解出 token 拿到原始 origin，
+    把当前 path+query 拼到 origin 上重新走代理。
+
+    这是修复"JS 内相对路径解析到 mitmproxy 自己而不是目标站"的关键。
+    没匹配则返回 None，让 _route 继续兜底首页。"""
+    try:
+        ref = (flow.request.headers.get("Referer") or "").strip()
+        if not ref:
+            return None
+        ref_u = urlparse(ref)
+        if ref_u.path != "/browser/proxy":
+            return None
+        # 从 Referer 的 query 里取 u（fernet token）或 url（明文，向后兼容）
+        qs = parse_qs(ref_u.query or "", keep_blank_values=True)
+        tok = (qs.get("u") or [""])[0]
+        if tok:
+            origin_url = _unobfuscate(tok) or ""
+        else:
+            origin_url = (qs.get("url") or [""])[0]
+        if not origin_url:
+            return None
+        o = urlparse(origin_url)
+        if not o.hostname:
+            return None
+        # 拼出当前请求要访问的真实外站 URL
+        cur_path = _url_path(flow) or "/"
+        raw_query = ""
+        try:
+            raw_query = urlparse(flow.request.pretty_url).query or ""
+        except (TypeError, ValueError):
+            pass
+        scheme = o.scheme or "https"
+        netloc = o.netloc
+        target = f"{scheme}://{netloc}{cur_path}"
+        if raw_query:
+            target += "?" + raw_query
+        # 把这个外站 URL 当代理目标重新调一次 _browser_proxy_response，
+        # 但 _browser_proxy_response 是从 query 取 u/url 的，
+        # 我们直接调底层 fetch + 改写并返回。
+        try:
+            ctx_user = user_auth.get_user_ctx_from_flow(flow)
+            user = ctx_user.username if ctx_user else "anonymous"
+        except Exception:  # noqa: BLE001
+            user = "anonymous"
+        try:
+            body, ctype, target = _browser_fetch_url(target, user=user)
+        except Exception:  # noqa: BLE001
+            return None
+        # 不要 bypass — Pad 永远只通过 mitmproxy origin 走
+        headers = {"Referrer-Policy": "same-origin"}
+        low_ct = (ctype or "").lower()
+        is_html = ("text/html" in low_ct) or ("application/xhtml" in low_ct) or body[:256].lstrip().startswith(b"<!")
+        if is_html:
+            cs = _sniff_html_charset(ctype, body)
+            try:
+                text = body.decode(cs, errors="replace")
+            except (LookupError, UnicodeDecodeError):
+                text = body.decode("utf-8", errors="replace")
+            text = _browser_rewrite_html(text, target)
+            body = text.encode("utf-8")
+            headers["Content-Type"] = "text/html; charset=utf-8"
+            headers["Cache-Control"] = "no-store"
+        elif "css" in low_ct:
+            cs = _sniff_html_charset(ctype, body)
+            try:
+                text = body.decode(cs, errors="replace")
+            except (LookupError, UnicodeDecodeError):
+                text = body.decode("utf-8", errors="replace")
+            text = _rewrite_css_text(text, target)
+            body = text.encode("utf-8")
+            headers["Content-Type"] = "text/css; charset=utf-8"
+            headers["Cache-Control"] = "public, max-age=300"
+        else:
+            headers["Content-Type"] = ctype
+            if low_ct.startswith(("image/", "font/")) or "javascript" in low_ct or low_ct.startswith("video/") or low_ct.startswith("audio/"):
+                headers["Cache-Control"] = "public, max-age=300"
+            else:
+                headers["Cache-Control"] = "no-store"
+        return Response.make(200, body, headers)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _browser_go_response(flow) -> Response:
@@ -7548,6 +7633,12 @@ def _route(flow) -> Response:
             return _browser_proxy_response(flow)
         if path == "/browse_web":
             return _browse_web_response(flow)
+        # 浏览器代理兜底：路径不属于 VerPadProxy 已知路由时，看 Referer
+        # 是否来自 /browser/proxy；如果是，把 path+query 拼到原始 origin
+        # 重新代理 fetch。这样 JS 内相对路径加载的子资源也都走代理。
+        resp = _browser_referer_fallback(flow)
+        if resp is not None:
+            return resp
         # 兜底：首页
         return _home_response(flow)
     except Exception as e:  # noqa: BLE001
