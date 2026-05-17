@@ -7114,21 +7114,47 @@ def _browser_page_response(flow) -> Response:
 <div class="content">
   {notice}
   <div class="card">
-    <form method="get" action="/browser/go">
-      <input class="input" type="text" name="url" required autofocus
-             inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
-             placeholder="输入网址" style="width:100%">
-      <div class="row" style="margin-top:12px;gap:8px;flex-wrap:wrap">
-        <button class="btn btn-primary" type="submit">前往</button>
-        <button class="btn btn-ghost" type="submit" formaction="/browser/direct">直连</button>
-      </div>
-    </form>
+    <input class="input" type="text" id="vp-start-url" required autofocus
+           inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+           placeholder="输入网址" style="width:100%">
+    <div class="row" style="margin-top:12px;gap:8px;flex-wrap:wrap">
+      <button type="button" class="btn btn-primary" id="vp-start-go">前往</button>
+      <button type="button" class="btn btn-ghost" id="vp-start-direct">直连</button>
+    </div>
   </div>
   <div class="card">
     <div style="display:flex;gap:8px;flex-wrap:wrap">{chips}</div>
   </div>
-</div>"""
-    return _html_response(_shell("浏览器", body))
+</div>
+<script>(function(){{
+  // 起始页跳转：用 location.href 走 JS，绝不依赖 form submit，
+  // 避免被 _shell 注入的退出 fab / mitm-trap JS（addEventListener click/submit）吞事件。
+  var input = document.getElementById('vp-start-url');
+  function go(){{
+    var v = (input.value || '').trim();
+    if(!v) return;
+    location.href = '/browser/go?url=' + encodeURIComponent(v);
+  }}
+  function direct(){{
+    var v = (input.value || '').trim();
+    if(!v) return;
+    location.href = '/browser/direct?url=' + encodeURIComponent(v);
+  }}
+  document.getElementById('vp-start-go').addEventListener('click', function(e){{
+    e.preventDefault(); e.stopPropagation(); go();
+  }}, true);
+  document.getElementById('vp-start-direct').addEventListener('click', function(e){{
+    e.preventDefault(); e.stopPropagation(); direct();
+  }}, true);
+  input.addEventListener('keydown', function(e){{
+    if(e.key === 'Enter' || e.keyCode === 13){{ e.preventDefault(); go(); }}
+  }}, true);
+}})();</script>"""
+    # 起始页不要 splash fab / mini player / exit telemetry，避免它们的全局 click/submit 拦截
+    return _html_response(_shell(
+        "浏览器", body,
+        show_splash_fab=False, exit_telemetry=False, mini_player=False,
+    ))
 
 
 def _dispatch_open(flow, path: Path) -> Response:
