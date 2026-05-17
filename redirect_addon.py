@@ -2531,7 +2531,7 @@ def _home_response(flow) -> Response:
         if user_auth.feature_allowed(ctx, "fe_browse"):
             parts_t.append(_tile('/browse', '📁', '全部文件', '文件浏览器'))
         if user_auth.feature_allowed(ctx, "fe_browser"):
-            parts_t.append(_tile('/browser', '🌐', '浏览器', '多标签 · 地址栏常驻 · 手机代拉网页'))
+            parts_t.append(_tile('/browser', '🌐', '浏览器', ''))
     grid_inner = "".join(parts_t) if parts_t else '<div class="card" style="grid-column:1/-1"><p class="muted" style="margin:0">当前账号未开启任何入口，请联系管理员。</p></div>'
     nav: list[str] = ['<span class="spacer"></span>']
     if ctx is not None:
@@ -6442,15 +6442,19 @@ html.vp-browser body{padding-top:54px!important;margin-top:0!important}
   <div class="vp-urlbox">
     <input id="vp-url" value="__VP_CUR_URL__" type="text" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="输入网址">
     <button class="vp-go" id="vp-go">前往</button>
+    <button id="vp-direct" title="直连：不走代理改写">直</button>
   </div>
 </div>
 <script>(function(){
   document.documentElement.classList.add('vp-browser');
-  // 关键：所有跳转都拼 location.origin，避免被注入的 <base> 影响
   var ORG = location.origin;
   function go(raw){
     if(!raw) return;
     location.href = ORG + '/browser/go?url=' + encodeURIComponent(raw);
+  }
+  function direct(raw){
+    if(!raw) return;
+    location.href = ORG + '/browser/direct?url=' + encodeURIComponent(raw);
   }
   document.getElementById('vp-home').onclick = function(){ location.href = ORG + '/'; };
   document.getElementById('vp-back').onclick = function(){ history.back(); };
@@ -6458,6 +6462,7 @@ html.vp-browser body{padding-top:54px!important;margin-top:0!important}
   document.getElementById('vp-reload').onclick = function(){ location.reload(); };
   var input = document.getElementById('vp-url');
   document.getElementById('vp-go').onclick = function(){ go(input.value); };
+  document.getElementById('vp-direct').onclick = function(){ direct(input.value); };
   input.addEventListener('keydown', function(e){ if(e.key === 'Enter'){ e.preventDefault(); go(input.value); } });
 })();</script>
 """
@@ -6805,27 +6810,33 @@ def _browser_rewrite_html(html_text: str, page_url: str) -> str:
 
     # 3) 顶部注入：sticky 地址栏 chrome + JS 拦截
     chrome = _BROWSER_CHROME_HTML.replace("__VP_CUR_URL__", html.escape(page_url, quote=True))
-    # 把 chrome 放在 <body> 后面；找不到 body 就直接 prepend
-    if re.search(r"<body[^>]*>", out, re.IGNORECASE):
-        out = re.sub(r"(<body[^>]*>)", r"\1" + chrome, out, count=1, flags=re.IGNORECASE)
+    # 注意：传入 re.sub 的字符串替换里若含 "\s" "\1" 等，会被 Python 当作 regex 转义解释报错。
+    # 一律用 lambda 返回字符串，规避一切转义解释。
+    body_re = re.compile(r"<body[^>]*>", re.IGNORECASE)
+    m_body = body_re.search(out)
+    if m_body:
+        out = out[:m_body.end()] + chrome + out[m_body.end():]
     else:
         out = chrome + out
 
     # 4) 在 <head> 里注入：base href + referrer + 运行时 fetch/XHR/window.open 拦截
-    # base href 指向目标站 → 让 JS 动态生成的 /video/xxx 等相对 URL 解析到目标站
-    # chrome 全部按钮已经改用 location.origin + path（不再依赖相对 URL），所以 base 不影响 chrome
     head_inject = (
         f'<base href="{html.escape(page_url, quote=True)}">'
         '<meta name="referrer" content="no-referrer">'
         '<style>html,body{margin-top:0!important}</style>'
         + _BROWSER_RUNTIME_JS.replace("__VP_PAGE_URL__", json.dumps(page_url))
     )
-    if re.search(r"<head[^>]*>", out, re.IGNORECASE):
-        out = re.sub(r"(<head[^>]*>)", r"\1" + head_inject, out, count=1, flags=re.IGNORECASE)
-    elif re.search(r"<html[^>]*>", out, re.IGNORECASE):
-        out = re.sub(r"(<html[^>]*>)", r"\1<head>" + head_inject + "</head>", out, count=1, flags=re.IGNORECASE)
+    head_re = re.compile(r"<head[^>]*>", re.IGNORECASE)
+    html_re = re.compile(r"<html[^>]*>", re.IGNORECASE)
+    m_head = head_re.search(out)
+    if m_head:
+        out = out[:m_head.end()] + head_inject + out[m_head.end():]
     else:
-        out = "<head>" + head_inject + "</head>" + out
+        m_html = html_re.search(out)
+        if m_html:
+            out = out[:m_html.end()] + "<head>" + head_inject + "</head>" + out[m_html.end():]
+        else:
+            out = "<head>" + head_inject + "</head>" + out
 
     return out
 
@@ -7016,6 +7027,29 @@ def _browser_go_response(flow) -> Response:
                           "Cache-Control": "no-store"})
 
 
+def _browser_direct_response(flow) -> Response:
+    """直连模式：把目标 host 加入透传白名单 → 303 真实 URL。
+
+    Pad 浏览器后续对该 host 的 HTTP/HTTPS 请求会被 mitmproxy 原样转发，
+    效果等同于"不走代理改写、直接访问网站"。HTTPS 走 CONNECT 隧道，
+    Pad 看到的是目标站真实证书，无需装 CA。"""
+    raw = _query_first(flow, "url", "u", default="")
+    norm = _normalize_browser_target(raw)
+    if not norm:
+        return Response.make(303, b"",
+                             {"Location": "/browser?err=1", "Cache-Control": "no-store"})
+    target_url, token = norm
+    _browser_bypass_add(token)
+    try:
+        h = (urlparse(target_url).hostname or "").lower()
+        if h:
+            _browser_bypass_add(h)
+    except (TypeError, ValueError):
+        pass
+    return Response.make(303, b"",
+                         {"Location": target_url, "Cache-Control": "no-store"})
+
+
 def _browser_allow_response(flow) -> Response:
     raw = _query_first(flow, "url", "u", default="")
     norm = _normalize_browser_target(raw)
@@ -7076,6 +7110,7 @@ def _browser_page_response(flow) -> Response:
              placeholder="输入网址" style="width:100%">
       <div class="row" style="margin-top:12px;gap:8px;flex-wrap:wrap">
         <button class="btn btn-primary" type="submit">前往</button>
+        <button class="btn btn-ghost" type="submit" formaction="/browser/direct">直连</button>
       </div>
     </form>
   </div>
@@ -7420,6 +7455,8 @@ def _route(flow) -> Response:
             return _browser_page_response(flow)
         if path == "/browser/go":
             return _browser_go_response(flow)
+        if path == "/browser/direct":
+            return _browser_direct_response(flow)
         if path == "/browser/allow":
             return _browser_allow_response(flow)
         if path.startswith("/browser/proxy"):
