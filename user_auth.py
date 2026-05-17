@@ -31,6 +31,41 @@ _LOCK = threading.RLock()
 # sid -> {username, created, ip, ua, last_seen}
 _SESSIONS: dict[str, dict[str, Any]] = {}
 
+
+def _sessions_path() -> Path:
+    return _mitm_dir() / "mitm_sessions.json"
+
+
+def _load_sessions_from_disk() -> None:
+    """启动时加载磁盘会话，避免重启把所有用户踢下线。"""
+    p = _sessions_path()
+    if not p.is_file():
+        return
+    try:
+        with _LOCK:
+            data = json.loads(p.read_text(encoding="utf-8") or "{}")
+            if isinstance(data, dict):
+                # 兼容历史空文件
+                sess = data.get("sessions") if isinstance(data.get("sessions"), dict) else data
+                for sid, meta in (sess or {}).items():
+                    if isinstance(sid, str) and isinstance(meta, dict):
+                        _SESSIONS[sid] = meta
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+
+
+def _persist_sessions_locked() -> None:
+    """必须在已持锁的上下文里调用：把当前 _SESSIONS 原子写盘。"""
+    p = _sessions_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8", newline="\n") as f:
+            json.dump({"version": 1, "sessions": _SESSIONS}, f, ensure_ascii=False)
+        tmp.replace(p)
+    except OSError:
+        pass
+
 # 各功能是否可见/可用（管理员默认全开）
 FE_KEYS = (
     "fe_home", "fe_pdf", "fe_video", "fe_music", "fe_upload", "fe_browse",
@@ -136,9 +171,16 @@ def _bootstrap_if_empty() -> None:
     _write_store_unlocked(d)
 
 
+_SESSIONS_LOADED = False
+
+
 def _ensure_bootstrap() -> None:
+    global _SESSIONS_LOADED
     with _LOCK:
         _bootstrap_if_empty()
+        if not _SESSIONS_LOADED:
+            _load_sessions_from_disk()
+            _SESSIONS_LOADED = True
 
 
 # ---------------------------------------------------------------------------
@@ -239,12 +281,14 @@ def login_user(username: str, password: str, *, ip: str = "", ua: str = "") -> t
             "ip": ip or "",
             "ua": ua or "",
         }
+        _persist_sessions_locked()
         return sid, None
 
 
 def logout_and_clear(sid: str) -> None:
     with _LOCK:
         _SESSIONS.pop(sid, None)
+        _persist_sessions_locked()
 
 
 def logout_from_flow(flow) -> None:
@@ -261,6 +305,8 @@ def kick_user(username: str) -> int:
         for sid in [s for s, m in _SESSIONS.items() if (m or {}).get("username") == username]:
             _SESSIONS.pop(sid, None)
             n += 1
+        if n:
+            _persist_sessions_locked()
     return n
 
 
