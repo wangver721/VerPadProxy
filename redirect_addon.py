@@ -6413,7 +6413,7 @@ _HREF_SRC_RE = re.compile(
     re.IGNORECASE,
 )
 
-# 顶部 sticky 地址栏 chrome（注入到代理页面 <body> 开头）
+# 顶部 sticky 地址栏 chrome：完全用 JS 绕开 base href 影响，跳转用 location.origin 拼绝对路径。
 _BROWSER_CHROME_HTML = r"""
 <style id="vp-bchrome-style">
 #vp-bchrome{position:fixed;top:0;left:0;right:0;z-index:2147483647;
@@ -6422,12 +6422,12 @@ _BROWSER_CHROME_HTML = r"""
   border-bottom:1px solid rgba(255,255,255,.18);
   font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;font-size:13px;color:#eaf0ff;
   box-shadow:0 2px 12px rgba(0,0,0,.35)}
-#vp-bchrome a,#vp-bchrome button{background:rgba(255,255,255,.08);color:#eaf0ff;
+#vp-bchrome button{background:rgba(255,255,255,.08);color:#eaf0ff;
   border:1px solid rgba(255,255,255,.16);border-radius:8px;min-width:38px;min-height:36px;
-  padding:0 10px;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;
+  padding:0 10px;display:inline-flex;align-items:center;justify-content:center;
   cursor:pointer;font-size:14px;line-height:1;box-sizing:border-box}
-#vp-bchrome a:hover,#vp-bchrome button:hover{background:rgba(255,255,255,.16)}
-#vp-bchrome form{flex:1;display:flex;gap:6px;margin:0;min-width:0}
+#vp-bchrome button:hover{background:rgba(255,255,255,.16)}
+#vp-bchrome .vp-urlbox{flex:1;display:flex;gap:6px;min-width:0}
 #vp-bchrome input{flex:1;min-width:0;padding:8px 10px;border-radius:8px;
   background:rgba(0,0,0,.45);color:#fff;border:1px solid rgba(255,255,255,.18);font-size:13px}
 #vp-bchrome .vp-go{background:linear-gradient(135deg,#5fa1ff,#b97cff);color:#fff;font-weight:700;border-color:transparent}
@@ -6435,16 +6435,31 @@ html.vp-browser{margin-top:0}
 html.vp-browser body{padding-top:54px!important;margin-top:0!important}
 </style>
 <div id="vp-bchrome" data-noproxy="1">
-  <a href="/" title="VerPadProxy 首页">🏠</a>
-  <button type="button" onclick="history.back()" title="后退">◀</button>
-  <button type="button" onclick="history.forward()" title="前进">▶</button>
-  <button type="button" onclick="location.reload()" title="刷新">↻</button>
-  <form action="/browser/go" method="get">
-    <input name="url" value="__VP_CUR_URL__" type="text" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="输入网址">
-    <button class="vp-go" type="submit">前往</button>
-  </form>
+  <button type="button" id="vp-home" title="首页">🏠</button>
+  <button type="button" id="vp-back" title="后退">◀</button>
+  <button type="button" id="vp-fwd" title="前进">▶</button>
+  <button type="button" id="vp-reload" title="刷新">↻</button>
+  <div class="vp-urlbox">
+    <input id="vp-url" value="__VP_CUR_URL__" type="text" inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="输入网址">
+    <button class="vp-go" id="vp-go">前往</button>
+  </div>
 </div>
-<script>document.documentElement.classList.add('vp-browser');</script>
+<script>(function(){
+  document.documentElement.classList.add('vp-browser');
+  // 关键：所有跳转都拼 location.origin，避免被注入的 <base> 影响
+  var ORG = location.origin;
+  function go(raw){
+    if(!raw) return;
+    location.href = ORG + '/browser/go?url=' + encodeURIComponent(raw);
+  }
+  document.getElementById('vp-home').onclick = function(){ location.href = ORG + '/'; };
+  document.getElementById('vp-back').onclick = function(){ history.back(); };
+  document.getElementById('vp-fwd').onclick = function(){ history.forward(); };
+  document.getElementById('vp-reload').onclick = function(){ location.reload(); };
+  var input = document.getElementById('vp-url');
+  document.getElementById('vp-go').onclick = function(){ go(input.value); };
+  input.addEventListener('keydown', function(e){ if(e.key === 'Enter'){ e.preventDefault(); go(input.value); } });
+})();</script>
 """
 
 # 注入到 <head> 开头的运行时拦截：fetch / XHR / window.open / form / 动态创建的 a
@@ -6655,9 +6670,10 @@ def _browser_rewrite_html(html_text: str, page_url: str) -> str:
     else:
         out = chrome + out
 
-    # 4) 在 <head> 里注入：base + referrer + 运行时 fetch/XHR/window.open 拦截
+    # 4) 在 <head> 里注入：referrer + 运行时 fetch/XHR/window.open 拦截
+    # 故意 不 注入 <base href>：会让 chrome 里的 / 链接全部跑到目标站。
+    # 主页面相对路径已经在服务端改写为 /browser/proxy?url=... 绝对形式，base 无影响。
     head_inject = (
-        f'<base href="{html.escape(page_url, quote=True)}">'
         '<meta name="referrer" content="no-referrer">'
         '<style>html,body{margin-top:0!important}</style>'
         + _BROWSER_RUNTIME_JS.replace("__VP_PAGE_URL__", json.dumps(page_url))
@@ -6672,27 +6688,44 @@ def _browser_rewrite_html(html_text: str, page_url: str) -> str:
     return out
 
 
-def _browser_fetch_url(url: str) -> tuple[bytes, str, str]:
+def _browser_cookie_jar(user: str) -> Path | None:
+    """按用户名隔离的 Netscape cookie 文件路径。匿名用户共享一个 anon jar。"""
+    env = (os.environ.get("MITM_DATA_DIR", "") or "").strip()
+    base = Path(env).expanduser().resolve() if env else _BASE
+    d = base / "browser_cookies"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    safe = re.sub(r"[^A-Za-z0-9_.\-]", "_", user or "anonymous")[:64] or "anonymous"
+    return d / f"{safe}.txt"
+
+
+def _browser_fetch_url(url: str, user: str = "") -> tuple[bytes, str, str]:
     """抓取页面；返回 (body, content-type, 最终 URL)。
 
     优先用 curl（Termux 上 Python urllib 在 IPv6+TLS 路径下会卡几十秒），
-    没有 curl 才回退到 urllib。"""
+    没有 curl 才回退到 urllib。cookie 按 user 隔离持久化在
+    `$MITM_DATA_DIR/browser_cookies/{user}.txt`。"""
+    cookie_jar = _browser_cookie_jar(user)
     curl = _which("curl")
     if curl:
-        # 头响应分隔输出：先 -i 拿到 header+body 一起，再 split
         try:
             cmd = [
-                curl, "-sSL", "-4",                # 强制 IPv4，绕开 IPv6 卡死
-                "-i",                              # 输出 header
+                curl, "-sSL", "-4",
+                "-i",
+                "--compressed",                    # 上游 gzip / br 自动解压
+                "--connect-timeout", "8",          # TCP/TLS 握手快速失败
                 "--max-time", str(_BROWSER_FETCH_TIMEOUT),
                 "--max-filesize", str(_BROWSER_MAX_BYTES),
                 "-A", _BROWSER_UA,
                 "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "-H", "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8",
-                "-H", "Accept-Encoding: identity",
                 "-w", "\n__VP_URL_EFFECTIVE__=%{url_effective}\n",
-                url,
             ]
+            if cookie_jar is not None:
+                cmd += ["-b", str(cookie_jar), "-c", str(cookie_jar)]
+            cmd.append(url)
             r = subprocess.run(
                 cmd, capture_output=True, timeout=_BROWSER_FETCH_TIMEOUT + 4, check=False,
             )
@@ -6772,8 +6805,14 @@ def _browser_proxy_response(flow) -> Response:
     if not norm:
         return _error_page("无效网址。示例：https://www.bilibili.com", status=400)
     target_url, _token = norm
+    # 多用户隔离：取当前账号名作为 cookie jar 维度
     try:
-        body, ctype, target_url = _browser_fetch_url(target_url)
+        ctx_user = user_auth.get_user_ctx_from_flow(flow)
+        user = ctx_user.username if ctx_user else "anonymous"
+    except Exception:  # noqa: BLE001
+        user = "anonymous"
+    try:
+        body, ctype, target_url = _browser_fetch_url(target_url, user=user)
     except Exception as e:  # noqa: BLE001
         msg = html.escape(str(e))
         err = (
@@ -6789,10 +6828,7 @@ def _browser_proxy_response(flow) -> Response:
         return _html_response(err.encode("utf-8"), status=502)
 
     # 剥掉妨碍嵌入/改写的响应头（我们只放本机的）
-    headers = {
-        "Cache-Control": "no-store",
-        "Referrer-Policy": "no-referrer",
-    }
+    headers = {"Referrer-Policy": "no-referrer"}
     low_ct = (ctype or "").lower()
     is_html = ("text/html" in low_ct) or ("application/xhtml" in low_ct) or body[:256].lstrip().startswith(b"<!")
     if is_html:
@@ -6804,8 +6840,14 @@ def _browser_proxy_response(flow) -> Response:
         text = _browser_rewrite_html(text, target_url)
         body = text.encode("utf-8")
         headers["Content-Type"] = "text/html; charset=utf-8"
+        headers["Cache-Control"] = "no-store"
     else:
         headers["Content-Type"] = ctype
+        # 图片 / CSS / JS / 字体 这类静态资源给个短缓存，少穿透手机
+        if low_ct.startswith(("image/", "font/")) or "css" in low_ct or "javascript" in low_ct or low_ct.startswith("video/") or low_ct.startswith("audio/"):
+            headers["Cache-Control"] = "public, max-age=300"
+        else:
+            headers["Cache-Control"] = "no-store"
     return Response.make(200, body, headers)
 
 
@@ -6848,7 +6890,6 @@ def _browser_page_response(flow) -> Response:
     """起始页：地址栏 + 一键直达常用站点。提交后 303 → /browser/proxy。"""
     start_url = (_query_first(flow, "url", default="") or "").strip()
     err = (_query_first(flow, "err", default="") or "").strip()
-    # 用户上来就带了 ?url=xxx，直接进代理
     if start_url:
         norm = _normalize_browser_target(start_url)
         if norm:
@@ -6856,7 +6897,7 @@ def _browser_page_response(flow) -> Response:
                                  {"Location": _browser_proxify_url(norm[0]),
                                   "Cache-Control": "no-store"})
     notice = ('<div class="card" style="border-color:rgba(255,180,124,.4);color:#ffd9b5;margin-bottom:12px">'
-              '网址无效，请重新输入。</div>') if err else ""
+              '网址无效</div>') if err else ""
     quick: list[tuple[str, str]] = [
         ("https://www.bilibili.com", "B 站"),
         ("https://www.baidu.com", "百度"),
@@ -6878,25 +6919,16 @@ def _browser_page_response(flow) -> Response:
   {notice}
   <div class="card">
     <form method="get" action="/browser/go">
-      <p class="muted" style="margin-top:0">由手机联网代拉网页再转发给 Pad；点链接会自动经过同样的代理。</p>
       <input class="input" type="text" name="url" required autofocus
              inputmode="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
-             placeholder="如 bilibili.com 或 https://example.com/path" style="width:100%">
+             placeholder="输入网址" style="width:100%">
       <div class="row" style="margin-top:12px;gap:8px;flex-wrap:wrap">
         <button class="btn btn-primary" type="submit">前往</button>
-        <a class="btn btn-ghost" href="/">取消</a>
       </div>
     </form>
   </div>
   <div class="card">
-    <div class="muted" style="margin-bottom:8px">快捷直达</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap">{chips}</div>
-  </div>
-  <div class="card">
-    <p class="muted" style="margin:0;font-size:.86rem;line-height:1.7">
-      <strong>提示</strong>：浏览器仅供合规自用场景。复杂前端站点（B 站等）受 JS 动态加载限制，
-      简单内容（搜索结果、文章、文档站、内网管理面板）体验最佳。
-    </p>
   </div>
 </div>"""
     return _html_response(_shell("浏览器", body))
