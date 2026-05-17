@@ -6466,18 +6466,21 @@ html.vp-browser body{padding-top:54px!important;margin-top:0!important}
 _BROWSER_RUNTIME_JS = r"""
 <script>(function(){
   var PAGE = __VP_PAGE_URL__;
+  var ORG  = location.origin;
   function abs(u){ try{ return new URL(u, PAGE).href; }catch(e){ return u; } }
   function isHttp(u){ return /^https?:/i.test(u); }
-  function isOurs(u){ return /^\/browser\/proxy/.test(u); }
+  function isOurs(u){ return /^https?:\/\/[^/]+\/browser\//.test(u) || /^\/browser\//.test(u); }
+  function isSkip(u){ return /^(javascript:|mailto:|tel:|data:|blob:|about:|#)/i.test(u); }
   function proxify(u){
     if(!u) return u;
     if(typeof u !== 'string') return u;
-    if(isOurs(u)) return u;
-    if(u.startsWith('javascript:')||u.startsWith('mailto:')||u.startsWith('tel:')||u.startsWith('data:')||u.startsWith('blob:')||u.startsWith('about:')||u.startsWith('#')) return u;
+    if(isOurs(u) || isSkip(u)) return u;
     var a = abs(u);
     if(!isHttp(a)) return u;
-    return '/browser/proxy?url=' + encodeURIComponent(a);
+    return ORG + '/browser/proxy?url=' + encodeURIComponent(a);
   }
+  window.__vpProxify = proxify;
+
   // fetch
   try{
     var _f = window.fetch;
@@ -6491,6 +6494,7 @@ _BROWSER_RUNTIME_JS = r"""
       };
     }
   }catch(e){}
+
   // XHR
   try{
     var _open = XMLHttpRequest.prototype.open;
@@ -6499,6 +6503,7 @@ _BROWSER_RUNTIME_JS = r"""
       return _open.apply(this, arguments);
     };
   }catch(e){}
+
   // window.open
   try{
     var _open2 = window.open;
@@ -6506,6 +6511,32 @@ _BROWSER_RUNTIME_JS = r"""
       return _open2.call(this, url ? proxify(url) : url, name, feat);
     };
   }catch(e){}
+
+  // location.assign / location.replace（无法覆盖 location.href setter，但这两个可以）
+  try{
+    var _assign = location.assign.bind(location);
+    location.assign = function(u){ _assign(proxify(u)); };
+  }catch(e){}
+  try{
+    var _replace = location.replace.bind(location);
+    location.replace = function(u){ _replace(proxify(u)); };
+  }catch(e){}
+
+  // history.pushState / replaceState：第三参数是 URL；通常只改 path，不会跳出本域，
+  // 但有些 SPA 会拼 https://target.com/x 作为 url，先 normalize 一下
+  try{
+    var _push = history.pushState.bind(history);
+    history.pushState = function(s, t, u){
+      try{ if(typeof u === 'string' && /^https?:/i.test(u)) u = '/browser/proxy?url=' + encodeURIComponent(u); }catch(e){}
+      return _push(s, t, u);
+    };
+    var _rep = history.replaceState.bind(history);
+    history.replaceState = function(s, t, u){
+      try{ if(typeof u === 'string' && /^https?:/i.test(u)) u = '/browser/proxy?url=' + encodeURIComponent(u); }catch(e){}
+      return _rep(s, t, u);
+    };
+  }catch(e){}
+
   // 表单 submit
   document.addEventListener('submit', function(ev){
     var f = ev.target;
@@ -6516,20 +6547,88 @@ _BROWSER_RUNTIME_JS = r"""
       }
     }catch(e){}
   }, true);
+
   // 点击：动态生成的 a 也兜底
   document.addEventListener('click', function(ev){
     var a = ev.target && ev.target.closest && ev.target.closest('a');
     if(!a) return;
+    if(a.closest('#vp-bchrome')) return;
     var h = a.getAttribute('href');
     if(!h) return;
     if(isOurs(h)) return;
-    if(a.closest('#vp-bchrome')) return;
-    if(h.startsWith('javascript:')||h.startsWith('mailto:')||h.startsWith('tel:')||h.startsWith('#')) return;
+    if(isSkip(h)) return;
     ev.preventDefault();
     var u = proxify(h);
     if(a.target === '_blank') window.open(u, '_blank');
     else location.href = u;
   }, true);
+
+  // MutationObserver：拦截 JS 动态创建/修改的元素，把 src/href/srcset/action 一路代理化
+  function fixupNode(node){
+    if(!node || node.nodeType !== 1) return;
+    if(node.closest && node.closest('#vp-bchrome')) return;
+    var tag = node.tagName;
+    var attrSrc = (tag === 'IMG' || tag === 'IFRAME' || tag === 'SCRIPT' || tag === 'VIDEO' || tag === 'AUDIO' || tag === 'SOURCE' || tag === 'EMBED' || tag === 'TRACK');
+    if(attrSrc){
+      var s = node.getAttribute('src');
+      if(s && !isOurs(s) && !isSkip(s)){
+        var ns = proxify(s);
+        if(ns !== s) node.setAttribute('src', ns);
+      }
+      var ss = node.getAttribute('srcset');
+      if(ss){
+        var parts = ss.split(',').map(function(p){
+          var t = p.trim().split(/\s+/);
+          if(t[0] && !isOurs(t[0]) && !isSkip(t[0])) t[0] = proxify(t[0]);
+          return t.join(' ');
+        });
+        var nss = parts.join(', ');
+        if(nss !== ss) node.setAttribute('srcset', nss);
+      }
+    }
+    if(tag === 'A' || tag === 'LINK' || tag === 'AREA'){
+      var h = node.getAttribute('href');
+      if(h && !isOurs(h) && !isSkip(h)){
+        var nh = proxify(h);
+        if(nh !== h) node.setAttribute('href', nh);
+      }
+    }
+    if(tag === 'FORM'){
+      var a = node.getAttribute('action');
+      if(a && !isOurs(a) && !isSkip(a)){
+        var na = proxify(a);
+        if(na !== a) node.setAttribute('action', na);
+      }
+    }
+  }
+  function walk(node){
+    fixupNode(node);
+    if(node && node.children){
+      for(var i = 0; i < node.children.length; i++) walk(node.children[i]);
+    }
+  }
+  try{
+    var mo = new MutationObserver(function(ms){
+      for(var i = 0; i < ms.length; i++){
+        var m = ms[i];
+        if(m.type === 'childList' && m.addedNodes){
+          for(var j = 0; j < m.addedNodes.length; j++) walk(m.addedNodes[j]);
+        } else if(m.type === 'attributes'){
+          fixupNode(m.target);
+        }
+      }
+    });
+    function startObserve(){
+      mo.observe(document.documentElement, {
+        childList: true, subtree: true, attributes: true,
+        attributeFilter: ['src','href','action','srcset','poster','data-src']
+      });
+      // 已经在 DOM 里的元素也扫一遍
+      walk(document.documentElement);
+    }
+    if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', startObserve);
+    else startObserve();
+  }catch(e){}
 })();</script>
 """
 
@@ -6613,6 +6712,37 @@ _SRCSET_RE = re.compile(
     r'(?P<attr>srcset)\s*=\s*(?P<q>["\'])(?P<val>(?:(?!(?P=q)).)*)(?P=q)',
     re.IGNORECASE,
 )
+# CSS url(...) 内部值
+_CSS_URL_RE = re.compile(
+    r'url\(\s*(?P<q>["\']?)(?P<val>[^"\')\s][^"\')]*?)(?P=q)\s*\)',
+    re.IGNORECASE,
+)
+# inline <style>...</style>
+_INLINE_STYLE_BLOCK_RE = re.compile(
+    r'(<style[^>]*>)(?P<body>[\s\S]*?)(</style>)', re.IGNORECASE,
+)
+# 行内 style="..." 属性
+_STYLE_ATTR_RE = re.compile(
+    r'\sstyle\s*=\s*(?P<q>["\'])(?P<val>(?:(?!(?P=q)).)*)(?P=q)', re.IGNORECASE,
+)
+
+
+def _rewrite_css_text(css: str, page_url: str) -> str:
+    def _repl(m: re.Match[str]) -> str:
+        raw_val = (m.group("val") or "").strip()
+        if not raw_val:
+            return m.group(0)
+        low = raw_val.lower()
+        if low.startswith(("data:", "blob:", "about:", "#")):
+            return m.group(0)
+        try:
+            abs_u = urljoin(page_url, raw_val)
+        except (TypeError, ValueError):
+            return m.group(0)
+        if not abs_u.startswith(("http://", "https://")):
+            return m.group(0)
+        return f'url("{_browser_proxify_url(abs_u)}")'
+    return _CSS_URL_RE.sub(_repl, css)
 
 
 def _browser_rewrite_html(html_text: str, page_url: str) -> str:
@@ -6662,6 +6792,17 @@ def _browser_rewrite_html(html_text: str, page_url: str) -> str:
     out = _REWRITE_ATTR_RE.sub(_repl_attr, html_text)
     out = _SRCSET_RE.sub(_repl_srcset, out)
 
+    # 改写 <style> 块和 style="" 属性里的 url()
+    def _repl_style_block(m: re.Match[str]) -> str:
+        return m.group(1) + _rewrite_css_text(m.group("body"), page_url) + m.group(3)
+
+    def _repl_style_attr(m: re.Match[str]) -> str:
+        new_val = _rewrite_css_text(m.group("val"), page_url)
+        return f' style={m.group("q")}{new_val}{m.group("q")}'
+
+    out = _INLINE_STYLE_BLOCK_RE.sub(_repl_style_block, out)
+    out = _STYLE_ATTR_RE.sub(_repl_style_attr, out)
+
     # 3) 顶部注入：sticky 地址栏 chrome + JS 拦截
     chrome = _BROWSER_CHROME_HTML.replace("__VP_CUR_URL__", html.escape(page_url, quote=True))
     # 把 chrome 放在 <body> 后面；找不到 body 就直接 prepend
@@ -6670,10 +6811,11 @@ def _browser_rewrite_html(html_text: str, page_url: str) -> str:
     else:
         out = chrome + out
 
-    # 4) 在 <head> 里注入：referrer + 运行时 fetch/XHR/window.open 拦截
-    # 故意 不 注入 <base href>：会让 chrome 里的 / 链接全部跑到目标站。
-    # 主页面相对路径已经在服务端改写为 /browser/proxy?url=... 绝对形式，base 无影响。
+    # 4) 在 <head> 里注入：base href + referrer + 运行时 fetch/XHR/window.open 拦截
+    # base href 指向目标站 → 让 JS 动态生成的 /video/xxx 等相对 URL 解析到目标站
+    # chrome 全部按钮已经改用 location.origin + path（不再依赖相对 URL），所以 base 不影响 chrome
     head_inject = (
+        f'<base href="{html.escape(page_url, quote=True)}">'
         '<meta name="referrer" content="no-referrer">'
         '<style>html,body{margin-top:0!important}</style>'
         + _BROWSER_RUNTIME_JS.replace("__VP_PAGE_URL__", json.dumps(page_url))
@@ -6841,10 +6983,20 @@ def _browser_proxy_response(flow) -> Response:
         body = text.encode("utf-8")
         headers["Content-Type"] = "text/html; charset=utf-8"
         headers["Cache-Control"] = "no-store"
+    elif "css" in low_ct:
+        # 外链 CSS：改写里面的 url(...)，让背景图 / 字体走代理
+        cs = _sniff_html_charset(ctype, body)
+        try:
+            text = body.decode(cs, errors="replace")
+        except (LookupError, UnicodeDecodeError):
+            text = body.decode("utf-8", errors="replace")
+        text = _rewrite_css_text(text, target_url)
+        body = text.encode("utf-8")
+        headers["Content-Type"] = "text/css; charset=utf-8"
+        headers["Cache-Control"] = "public, max-age=300"
     else:
         headers["Content-Type"] = ctype
-        # 图片 / CSS / JS / 字体 这类静态资源给个短缓存，少穿透手机
-        if low_ct.startswith(("image/", "font/")) or "css" in low_ct or "javascript" in low_ct or low_ct.startswith("video/") or low_ct.startswith("audio/"):
+        if low_ct.startswith(("image/", "font/")) or "javascript" in low_ct or low_ct.startswith("video/") or low_ct.startswith("audio/"):
             headers["Cache-Control"] = "public, max-age=300"
         else:
             headers["Cache-Control"] = "no-store"
