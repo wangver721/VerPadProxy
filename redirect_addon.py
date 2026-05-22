@@ -6488,6 +6488,64 @@ _BROWSER_RUNTIME_JS = r"""
   }
   window.__vpProxify = proxify;
 
+  // ---- 关键：同步劫持元素属性 setter，保证浏览器发请求前 URL 已被代理化 ----
+  // 不能依赖 MutationObserver（异步）：浏览器 img.src = 'https://i0.hdslb.com/x.jpg'
+  // 会立即触发资源请求，MutationObserver 回调时已经晚了。
+  function patchProp(proto, prop){
+    try{
+      var d = Object.getOwnPropertyDescriptor(proto, prop);
+      if(!d || !d.set) return;
+      var origSet = d.set, origGet = d.get;
+      Object.defineProperty(proto, prop, {
+        set: function(v){
+          try{ if(typeof v === 'string') v = proxify(v); }catch(e){}
+          return origSet.call(this, v);
+        },
+        get: function(){ return origGet ? origGet.call(this) : undefined; },
+        configurable: true,
+        enumerable: d.enumerable
+      });
+    }catch(e){}
+  }
+  // src 属性
+  if(window.HTMLImageElement)  patchProp(HTMLImageElement.prototype,  'src');
+  if(window.HTMLScriptElement) patchProp(HTMLScriptElement.prototype, 'src');
+  if(window.HTMLIFrameElement) patchProp(HTMLIFrameElement.prototype, 'src');
+  if(window.HTMLVideoElement)  patchProp(HTMLVideoElement.prototype,  'src');
+  if(window.HTMLAudioElement)  patchProp(HTMLAudioElement.prototype,  'src');
+  if(window.HTMLSourceElement) patchProp(HTMLSourceElement.prototype, 'src');
+  if(window.HTMLEmbedElement)  patchProp(HTMLEmbedElement.prototype,  'src');
+  if(window.HTMLTrackElement)  patchProp(HTMLTrackElement.prototype,  'src');
+  // href 属性
+  if(window.HTMLAnchorElement) patchProp(HTMLAnchorElement.prototype, 'href');
+  if(window.HTMLLinkElement)   patchProp(HTMLLinkElement.prototype,   'href');
+  if(window.HTMLAreaElement)   patchProp(HTMLAreaElement.prototype,   'href');
+  // form action
+  if(window.HTMLFormElement)   patchProp(HTMLFormElement.prototype,   'action');
+
+  // setAttribute / setAttributeNS 也同步拦截
+  try{
+    var origSetAttr = Element.prototype.setAttribute;
+    var URL_ATTRS = {'src':1,'href':1,'action':1,'poster':1,'data-src':1,'data-href':1,'formaction':1,'srcset':1};
+    Element.prototype.setAttribute = function(name, value){
+      var lower = (name || '').toLowerCase();
+      if(URL_ATTRS[lower] && typeof value === 'string'){
+        try{
+          if(lower === 'srcset'){
+            value = value.split(',').map(function(p){
+              var t = p.trim().split(/\s+/);
+              if(t[0]) t[0] = proxify(t[0]);
+              return t.join(' ');
+            }).join(', ');
+          } else {
+            value = proxify(value);
+          }
+        }catch(e){}
+      }
+      return origSetAttr.call(this, name, value);
+    };
+  }catch(e){}
+
   // fetch
   try{
     var _f = window.fetch;
