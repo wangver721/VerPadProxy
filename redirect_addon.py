@@ -6670,33 +6670,56 @@ _BROWSER_RUNTIME_JS = r"""
     }
     return pairs.join('&');
   }
+  function _doFormJump(f){
+    // 取 form.action（DOM 属性返回 resolved 绝对 URL，含 token）
+    var action = f.getAttribute('action') || '';
+    if(!action){ action = location.href; }
+    if(!isOurs(action) && isHttp(abs(action))){
+      action = proxify(action);
+    }
+    var actionAbs;
+    try{ actionAbs = new URL(action, location.href).href; }catch(e){ actionAbs = action; }
+    var method = (f.getAttribute('method') || f.method || 'get').toLowerCase();
+    if(method === 'get'){
+      var qs = _collectFormQuery(f);
+      var sep = actionAbs.indexOf('?') >= 0 ? '&' : '?';
+      location.href = actionAbs + (qs ? sep + qs : '');
+      return true;
+    } else {
+      f.action = actionAbs;
+      return false;
+    }
+  }
+  // 用户点击 submit 按钮触发的 submit 事件
   document.addEventListener('submit', function(ev){
     var f = ev.target;
     if(!f || f.tagName !== 'FORM') return;
     if(f.closest && f.closest('#vp-bchrome')) return;
     try{
-      // 取 form.action（DOM 属性返回 resolved 绝对 URL，含 token）
-      var action = f.getAttribute('action') || '';
-      if(!action){ action = location.href; }
-      // 不是我们代理的 URL 时先 proxify
-      if(!isOurs(action) && isHttp(abs(action))){
-        action = proxify(action);
-      }
-      // 解析 action 的绝对 URL
-      var actionAbs;
-      try{ actionAbs = new URL(action, location.href).href; }catch(e){ actionAbs = action; }
-      var method = (f.getAttribute('method') || f.method || 'get').toLowerCase();
-      if(method === 'get'){
-        ev.preventDefault();
-        var qs = _collectFormQuery(f);
-        var sep = actionAbs.indexOf('?') >= 0 ? '&' : '?';
-        location.href = actionAbs + (qs ? sep + qs : '');
-      } else {
-        // POST：把 form 的 action 写回代理 URL，让浏览器原生 POST submit 走代理
-        f.action = actionAbs;
-      }
+      if(_doFormJump(f)){ ev.preventDefault(); }
     }catch(e){}
   }, true);
+  // 程序化 form.submit() / form.requestSubmit() — 不触发 submit 事件，需要 monkey-patch
+  try{
+    var _formSubmit = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function(){
+      try{
+        if(this.closest && this.closest('#vp-bchrome')) return _formSubmit.call(this);
+        if(_doFormJump(this)) return;
+      }catch(e){}
+      return _formSubmit.call(this);
+    };
+    if(HTMLFormElement.prototype.requestSubmit){
+      var _reqSubmit = HTMLFormElement.prototype.requestSubmit;
+      HTMLFormElement.prototype.requestSubmit = function(btn){
+        try{
+          if(this.closest && this.closest('#vp-bchrome')) return _reqSubmit.call(this, btn);
+          if(_doFormJump(this)) return;
+        }catch(e){}
+        return _reqSubmit.call(this, btn);
+      };
+    }
+  }catch(e){}
 
   // 点击：动态生成的 a 也兜底
   document.addEventListener('click', function(ev){
@@ -7172,14 +7195,9 @@ def _browser_proxy_response(flow) -> Response:
         raw = _unobfuscate(raw) or raw
     if not raw:
         raw = _query_first(flow, "url", default="")
-    norm = _normalize_browser_target(raw)
-    if not norm:
-        return _error_page("无效网址。示例：https://www.bilibili.com", status=400)
-    target_url, token = norm
 
-    # 关键：form GET 提交时，浏览器会丢掉 action URL 上的原 query string
-    # 只保留 form fields。所以我们把请求 URL 上除 u/url 之外的所有 query
-    # 都合并到 target_url 里，让 Bing/Google/百度等搜索表单能工作。
+    # 收集除 u/url 之外的 query（form 提交追加的字段）
+    extra_str = ""
     try:
         full_q = urlparse(flow.request.pretty_url).query or ""
         if full_q:
@@ -7193,12 +7211,41 @@ def _browser_proxy_response(flow) -> Response:
                 extras.append(kv)
             if extras:
                 extra_str = "&".join(extras)
-                if "?" in target_url:
-                    target_url = target_url + "&" + extra_str
-                else:
-                    target_url = target_url + "?" + extra_str
     except (TypeError, ValueError):
         pass
+
+    norm = _normalize_browser_target(raw) if raw else None
+
+    # 兜底：raw 拿不到但有 extra_str → 通过 Referer 反推 origin URL
+    # （form.submit() 等程序化提交可能完全没传 u，只有 form fields）
+    if not norm and extra_str:
+        try:
+            ref = (flow.request.headers.get("Referer") or "").strip()
+            if ref:
+                ref_u = urlparse(ref)
+                if ref_u.path == "/browser/proxy":
+                    rq = parse_qs(ref_u.query or "", keep_blank_values=True)
+                    tok = (rq.get("u") or [""])[0]
+                    if tok:
+                        ref_target = _unobfuscate(tok) or ""
+                    else:
+                        ref_target = (rq.get("url") or [""])[0]
+                    if ref_target:
+                        # 用 referer 的 host+path，丢掉它的 query，换成当前 form fields
+                        rp = urlparse(ref_target)
+                        rebuilt = f"{rp.scheme}://{rp.netloc}{rp.path or '/'}"
+                        norm = _normalize_browser_target(rebuilt)
+        except (TypeError, ValueError):
+            pass
+
+    if not norm:
+        return _error_page("无效网址。示例：https://www.bilibili.com", status=400)
+    target_url, token = norm
+
+    # 把 form fields 合并到 target_url
+    if extra_str:
+        sep = "&" if "?" in target_url else "?"
+        target_url = target_url + sep + extra_str
     # 不再自动 bypass — 在受限平板（ForClass 黑名单）场景下，
     # bypass 会让 Pad 直连外站 host，URL 露出 bilibili.com 立刻被拦。
     # 让所有请求只走 mitmproxy origin（zzn.forclass.net），
