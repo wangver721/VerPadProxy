@@ -7144,6 +7144,29 @@ def _browser_proxy_response(flow) -> Response:
     if not norm:
         return _error_page("无效网址。示例：https://www.bilibili.com", status=400)
     target_url, token = norm
+
+    # 关键：form GET 提交时，浏览器会丢掉 action URL 上的原 query string
+    # 只保留 form fields。所以我们把请求 URL 上除 u/url 之外的所有 query
+    # 都合并到 target_url 里，让 Bing/Google/百度等搜索表单能工作。
+    try:
+        full_q = urlparse(flow.request.pretty_url).query or ""
+        if full_q:
+            extras: list[str] = []
+            for kv in full_q.split("&"):
+                if not kv:
+                    continue
+                k = kv.split("=", 1)[0]
+                if k in ("u", "url"):
+                    continue
+                extras.append(kv)
+            if extras:
+                extra_str = "&".join(extras)
+                if "?" in target_url:
+                    target_url = target_url + "&" + extra_str
+                else:
+                    target_url = target_url + "?" + extra_str
+    except (TypeError, ValueError):
+        pass
     # 不再自动 bypass — 在受限平板（ForClass 黑名单）场景下，
     # bypass 会让 Pad 直连外站 host，URL 露出 bilibili.com 立刻被拦。
     # 让所有请求只走 mitmproxy origin（zzn.forclass.net），
