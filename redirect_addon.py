@@ -723,6 +723,8 @@ def _activity_label_for_path(path: str, query: str, decoded_path: str) -> str:
         return "🎵 音乐播放器"
     if p == "/music_tracks":
         return "🎵 加载音乐列表"
+    if p == "/music_playlists":
+        return "🎵 播放列表管理"
     if p == "/subtitle" or p == "/subtitle_internal":
         return f"💬 字幕：{short or '?'}"
     if p == "/image":
@@ -5535,7 +5537,33 @@ def _music_response(flow) -> Response:
 .player-right{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden;
   background:rgba(12,16,24,.4);border-left:1px solid var(--line)}
 .playlist-head{padding:10px 14px;font-size:.82rem;font-weight:600;color:var(--muted);
-  border-bottom:1px solid var(--line);flex-shrink:0;background:rgba(0,0,0,.1)}
+  border-bottom:1px solid var(--line);flex-shrink:0;background:rgba(0,0,0,.1);display:flex;align-items:center;justify-content:space-between;gap:8px}
+.playlist-head .text-btn{font-size:.76rem;padding:4px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#eaf0ff;font-weight:600}
+.playlist-head .text-btn:active{background:rgba(255,255,255,.14)}
+.pls-chips{flex-shrink:0;display:flex;gap:6px;padding:8px 12px;overflow-x:auto;-webkit-overflow-scrolling:touch;border-bottom:1px solid var(--line);background:rgba(0,0,0,.08);scrollbar-width:none}
+.pls-chips::-webkit-scrollbar{display:none}
+.pls-chip{flex:0 0 auto;padding:5px 12px;border-radius:14px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);color:rgba(236,241,255,.78);font-size:.78rem;font-weight:600;white-space:nowrap;cursor:pointer}
+.pls-chip.active{background:linear-gradient(135deg,#5fa1ff,#b97cff);color:#fff;border-color:transparent;box-shadow:0 4px 12px rgba(95,161,255,.32)}
+.pls-chip .cnt{margin-left:5px;opacity:.7;font-weight:500}
+/* track 右侧操作菜单 */
+.track .menu-btn{flex:0 0 auto;width:30px;height:30px;border-radius:50%;background:rgba(255,255,255,.06);border:none;color:#eaf0ff;font-size:1.05rem;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;margin-left:4px;line-height:1}
+.track .menu-btn:active{background:rgba(255,255,255,.16)}
+.pls-modal{position:fixed;inset:0;z-index:2147482700;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.55);padding:20px}
+.pls-modal.show{display:flex}
+.pls-card{width:min(420px,100%);max-height:80vh;background:#181c2a;border:1px solid rgba(255,255,255,.18);border-radius:18px;padding:18px;color:#f4f7ff;display:flex;flex-direction:column;gap:14px;box-shadow:0 24px 60px rgba(0,0,0,.5)}
+.pls-h{font-size:1rem;font-weight:700}
+.pls-create{display:flex;gap:8px}
+.pls-create input{flex:1;min-width:0;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.22);background:rgba(0,0,0,.3);color:#fff;font-size:.92rem;outline:none}
+.pls-create input:focus{border-color:#9dd1ff}
+.pls-list{display:flex;flex-direction:column;gap:6px;overflow-y:auto;-webkit-overflow-scrolling:touch;min-height:0;flex:1}
+.pls-item{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:10px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08)}
+.pls-item .pls-n{flex:1;min-width:0;font-weight:600;font-size:.9rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pls-item .pls-cnt{font-size:.74rem;color:rgba(236,241,255,.6)}
+.pls-item button{min-height:28px;padding:0 10px;font-size:.78rem;border-radius:8px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#eaf0ff;font-weight:600;cursor:pointer}
+.pls-item button.danger{color:#ffb3b3;border-color:rgba(255,120,120,.3)}
+.pls-item .add-target{flex:1;text-align:left;justify-content:flex-start;padding:8px 12px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:10px;color:#eaf0ff;font-size:.9rem;cursor:pointer}
+.pls-item .add-target:active{background:rgba(255,255,255,.12)}
+.pls-empty{color:rgba(236,241,255,.5);font-size:.86rem;padding:10px 0;text-align:center}
 .playlist-scroll{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
 @media (max-width:900px){
   .app:has(.mitm-music-page){max-height:none;overflow:auto}
@@ -5646,8 +5674,16 @@ html.mitm-music-playing .immersive-cover{transform:scale(1);filter:brightness(1)
 """
     js = r"""
 (function(){
-  var tracks = JSON.parse(document.getElementById('mitm-tracks').textContent||'[]');
+  var allTracks = JSON.parse(document.getElementById('mitm-tracks').textContent||'[]');
+  var tracks = allTracks; // 当前显示的曲目集（切换列表时改成子集）
   var audio = document.getElementById('audio');
+  // 自定义列表数据：[{id,name,tracks:[rel,...],created,updated}, ...]
+  var customLists = [];
+  // 当前激活列表 id：'' = 全部音乐
+  var activeListId = '';
+  // rel -> track 的快速查表
+  var trackByRel = {};
+  allTracks.forEach(function(t){ if(t.rel) trackByRel[t.rel] = t; });
 
   // 普通模式
   var elTitle = document.getElementById('np-title');
@@ -5771,21 +5807,33 @@ html.mitm-music-playing .immersive-cover{transform:scale(1);filter:brightness(1)
       var meta = metaText(t);
       if (t.track_no) meta = '#'+t.track_no + (meta ? ' · ' + meta : '');
       var coverAttr = t.cover ? ' data-cover="'+t.cover+'"' : '';
-      html += '<div class="track'+(i===curIdx?' active':'')+'" data-i="'+i+'">'
+      var relAttr = t.rel ? ' data-rel="'+escape(t.rel)+'"' : '';
+      html += '<div class="track'+(i===curIdx?' active':'')+'" data-i="'+i+'"'+relAttr+'>'
            +  '<div class="idx">'+(i+1)+'</div>'
            +  '<div class="thumb"'+coverAttr+'></div>'
            +  '<div class="info"><div class="name">'+escape(t.name)+'</div>'
            +  '<div class="meta">'+escape(meta||' ')+'</div></div>'
+           +  '<button class="menu-btn" type="button" title="加入/移除列表">⋯</button>'
            +  '</div>';
     });
     elPlaylist.innerHTML = html;
     ensureThumbObserver();
     elPlaylist.querySelectorAll('.track').forEach(function(el){
-      el.addEventListener('click', function(){ playIndex(parseInt(el.getAttribute('data-i')||'0', 10)); });
+      el.addEventListener('click', function(ev){
+        if (ev.target && ev.target.classList && ev.target.classList.contains('menu-btn')) return;
+        playIndex(parseInt(el.getAttribute('data-i')||'0', 10));
+      });
       var thumb = el.querySelector('.thumb');
       if (thumb && thumb.dataset.cover){
         if (thumbObserver) thumbObserver.observe(thumb);
         else thumb.style.backgroundImage = 'url(' + thumb.dataset.cover + ')';
+      }
+      var btn = el.querySelector('.menu-btn');
+      if (btn){
+        btn.addEventListener('click', function(ev){
+          ev.preventDefault(); ev.stopPropagation();
+          openAddTo(el.getAttribute('data-rel') || '');
+        }, true);
       }
     });
     // 当前激活行立即加载封面（无需等滚动）
@@ -5796,6 +5844,173 @@ html.mitm-music-playing .immersive-cover{transform:scale(1);filter:brightness(1)
       if (thumbObserver) thumbObserver.unobserve(act);
     }
   }
+
+  // ===== 自定义播放列表 =====
+  var elPlsChips = document.getElementById('pls-chips');
+  var elPlsTitle = document.getElementById('playlist-title');
+  var elPlsModal = document.getElementById('pls-modal');
+  var elPlsList = document.getElementById('pls-list');
+  var elAddToModal = document.getElementById('add-to-modal');
+  var elAddToList = document.getElementById('add-to-list');
+  var addToRel = '';
+
+  function fetchPlaylists(){
+    return fetch('/music_playlists', {credentials:'include'}).then(function(r){
+      return r.ok ? r.json() : {ok:false, lists:[]};
+    }).then(function(d){
+      customLists = (d && d.ok && Array.isArray(d.lists)) ? d.lists : [];
+      renderChips();
+      return customLists;
+    }).catch(function(){ customLists = []; renderChips(); });
+  }
+
+  function renderChips(){
+    var html = '<div class="pls-chip'+(activeListId===''?' active':'')+'" data-id="">全部 <span class="cnt">'+allTracks.length+'</span></div>';
+    customLists.forEach(function(pl){
+      html += '<div class="pls-chip'+(activeListId===pl.id?' active':'')+'" data-id="'+escape(pl.id)+'">'+escape(pl.name)+' <span class="cnt">'+(pl.tracks||[]).length+'</span></div>';
+    });
+    elPlsChips.innerHTML = html;
+    elPlsChips.querySelectorAll('.pls-chip').forEach(function(c){
+      c.addEventListener('click', function(){ switchList(c.getAttribute('data-id')||''); });
+    });
+  }
+
+  function switchList(id){
+    if (id === activeListId) return;
+    activeListId = id;
+    if (id === ''){
+      tracks = allTracks;
+      elPlsTitle.textContent = '全部音乐';
+    } else {
+      var pl = customLists.find(function(x){ return x.id === id; });
+      if (!pl){ tracks = allTracks; activeListId=''; elPlsTitle.textContent='全部音乐'; }
+      else {
+        tracks = pl.tracks.map(function(rel){ return trackByRel[rel]; }).filter(function(x){return !!x;});
+        elPlsTitle.textContent = pl.name;
+      }
+    }
+    // 当前曲目还在的话保持索引，否则回到 0
+    var curT = (allTracks[curIdx] || null);
+    curIdx = 0;
+    if (curT){
+      var ni = tracks.findIndex(function(t){ return t.rel === curT.rel; });
+      if (ni >= 0) curIdx = ni;
+    }
+    renderChips();
+    renderPlaylist();
+  }
+
+  function openPlsModal(){
+    renderPlsManagement();
+    elPlsModal.classList.add('show');
+    elPlsModal.setAttribute('aria-hidden','false');
+  }
+  function closePlsModal(){
+    elPlsModal.classList.remove('show');
+    elPlsModal.setAttribute('aria-hidden','true');
+  }
+  function renderPlsManagement(){
+    if (!customLists.length){
+      elPlsList.innerHTML = '<div class="pls-empty">还没有自定义列表，创建一个吧。</div>';
+      return;
+    }
+    var html = '';
+    customLists.forEach(function(pl){
+      html += '<div class="pls-item" data-id="'+escape(pl.id)+'">'
+           + '<div class="pls-n">'+escape(pl.name)+'</div>'
+           + '<div class="pls-cnt">'+(pl.tracks||[]).length+' 首</div>'
+           + '<button class="rename" type="button">改名</button>'
+           + '<button class="danger del" type="button">删除</button>'
+           + '</div>';
+    });
+    elPlsList.innerHTML = html;
+    elPlsList.querySelectorAll('.pls-item').forEach(function(el){
+      var pid = el.getAttribute('data-id');
+      el.querySelector('.rename').addEventListener('click', function(){
+        var pl = customLists.find(function(x){return x.id===pid;});
+        var name = prompt('新名称', pl ? pl.name : '');
+        if (!name) return;
+        plsCall({action:'rename', id:pid, name:name}).then(fetchPlaylists).then(renderPlsManagement);
+      });
+      el.querySelector('.del').addEventListener('click', function(){
+        if (!confirm('确认删除这个列表？曲目不会被删除。')) return;
+        plsCall({action:'delete', id:pid}).then(function(){
+          if (activeListId===pid){ switchList(''); }
+          return fetchPlaylists();
+        }).then(renderPlsManagement);
+      });
+    });
+  }
+  function plsCall(payload){
+    return fetch('/music_playlists', {
+      method:'POST',
+      credentials:'include',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)
+    }).then(function(r){ return r.ok ? r.json() : {ok:false}; });
+  }
+
+  function openAddTo(rel){
+    addToRel = rel;
+    if (!customLists.length){
+      elAddToList.innerHTML = '<div class="pls-empty">还没有自定义列表，先去管理面板创建一个。</div>';
+    } else {
+      var html = '';
+      customLists.forEach(function(pl){
+        var has = (pl.tracks||[]).indexOf(rel) >= 0;
+        html += '<div class="pls-item">'
+             + '<button class="add-target" data-id="'+escape(pl.id)+'" data-has="'+(has?'1':'0')+'" type="button">'
+             + escape(pl.name) + (has?' ✓':'') + '</button>'
+             + '</div>';
+      });
+      elAddToList.innerHTML = html;
+      elAddToList.querySelectorAll('.add-target').forEach(function(btn){
+        btn.addEventListener('click', function(){
+          var pid = btn.getAttribute('data-id');
+          var has = btn.getAttribute('data-has') === '1';
+          plsCall({action: has?'remove_track':'add_track', id:pid, rel:addToRel})
+            .then(fetchPlaylists)
+            .then(function(){
+              elAddToModal.classList.remove('show');
+              elAddToModal.setAttribute('aria-hidden','true');
+              // 若当前显示的是被改动的列表，重新渲染
+              if (activeListId === pid){ switchList(pid); }
+            });
+        });
+      });
+    }
+    elAddToModal.classList.add('show');
+    elAddToModal.setAttribute('aria-hidden','false');
+  }
+
+  // 绑定 UI 入口
+  document.getElementById('btn-manage-pls').addEventListener('click', openPlsModal);
+  document.getElementById('pls-close').addEventListener('click', closePlsModal);
+  document.getElementById('add-to-cancel').addEventListener('click', function(){
+    elAddToModal.classList.remove('show');
+    elAddToModal.setAttribute('aria-hidden','true');
+  });
+  document.getElementById('pls-create-btn').addEventListener('click', function(){
+    var input = document.getElementById('pls-new-name');
+    var name = (input.value||'').trim();
+    if (!name){ name = '新建列表'; }
+    plsCall({action:'create', name:name}).then(function(){
+      input.value = '';
+      return fetchPlaylists();
+    }).then(renderPlsManagement);
+  });
+  // 点击 modal 背景关闭
+  [elPlsModal, elAddToModal].forEach(function(m){
+    m.addEventListener('click', function(ev){
+      if (ev.target === m){
+        m.classList.remove('show');
+        m.setAttribute('aria-hidden','true');
+      }
+    });
+  });
+
+  // 首次加载播放列表
+  fetchPlaylists();
 
   // 封面取色（同源 /file?path=... 可读 canvas）
   var paletteCache = {};
@@ -6206,9 +6421,39 @@ html.mitm-music-playing .immersive-cover{transform:scale(1);filter:brightness(1)
       </div>
     </aside>
     <div class="player-right">
-      <div class="playlist-head">播放列表</div>
+      <div class="playlist-head">
+        <span id="playlist-title">全部音乐</span>
+        <button id="btn-manage-pls" class="text-btn" title="管理自定义列表" type="button">列表</button>
+      </div>
+      <div id="pls-chips" class="pls-chips"></div>
       <div class="playlist-scroll">
         <div id="playlist" data-empty-dir="{html.escape(_DIR_MUSIC)}"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 播放列表管理 modal -->
+  <div class="pls-modal" id="pls-modal" aria-hidden="true">
+    <div class="pls-card">
+      <div class="pls-h">我的播放列表</div>
+      <div class="pls-create">
+        <input id="pls-new-name" type="text" placeholder="新列表名" maxlength="40">
+        <button id="pls-create-btn" class="jump-btn primary" type="button">创建</button>
+      </div>
+      <div id="pls-list" class="pls-list"></div>
+      <div class="jump-row">
+        <button class="jump-btn" id="pls-close" type="button">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 加入列表选择 modal -->
+  <div class="pls-modal" id="add-to-modal" aria-hidden="true">
+    <div class="pls-card">
+      <div class="pls-h">加入播放列表</div>
+      <div id="add-to-list" class="pls-list"></div>
+      <div class="jump-row">
+        <button class="jump-btn" id="add-to-cancel" type="button">取消</button>
       </div>
     </div>
   </div>
@@ -7745,6 +7990,154 @@ def _is_browser_bypass(flow) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# 用户级音乐播放列表
+# ---------------------------------------------------------------------------
+# 结构：
+# {
+#   "version": 1,
+#   "lists": {
+#     "<username>": [
+#       {"id":"pl_xxx","name":"我的歌单","tracks":["音乐/foo.mp3", ...],
+#        "created":1234.5, "updated":5678.9}
+#     ]
+#   }
+# }
+_PLAYLISTS_LOCK = threading.RLock()
+
+
+def _playlists_path() -> Path:
+    env = (os.environ.get("MITM_DATA_DIR", "") or "").strip()
+    base = Path(env).expanduser().resolve() if env else _BASE
+    return base / "mitm_playlists.json"
+
+
+def _playlists_load() -> dict:
+    p = _playlists_path()
+    if not p.is_file():
+        return {"version": 1, "lists": {}}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8") or "{}")
+        if not isinstance(d, dict):
+            return {"version": 1, "lists": {}}
+        if not isinstance(d.get("lists"), dict):
+            d["lists"] = {}
+        return d
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {"version": 1, "lists": {}}
+
+
+def _playlists_save(data: dict) -> None:
+    p = _playlists_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp.replace(p)
+    except OSError:
+        pass
+
+
+def _playlists_for_user(user: str) -> list[dict]:
+    if not user:
+        return []
+    with _PLAYLISTS_LOCK:
+        d = _playlists_load()
+        return [_pl_normalize(x) for x in (d.get("lists", {}).get(user) or [])]
+
+
+def _pl_normalize(pl: dict) -> dict:
+    """补全播放列表对象的字段，避免老数据缺字段炸前端。"""
+    return {
+        "id": str(pl.get("id") or ""),
+        "name": str(pl.get("name") or "未命名"),
+        "tracks": [str(t) for t in (pl.get("tracks") or []) if isinstance(t, str)],
+        "created": float(pl.get("created") or 0),
+        "updated": float(pl.get("updated") or pl.get("created") or 0),
+    }
+
+
+def _pl_new_id() -> str:
+    return "pl_" + base64.urlsafe_b64encode(os.urandom(9)).decode("ascii").rstrip("=")
+
+
+def _playlists_response(flow) -> Response:
+    """JSON API：列表 / 创建 / 改名 / 删除 / 加歌 / 移歌 / 重排序。"""
+    ctx = user_auth.get_user_ctx_from_flow(flow)
+    user = (getattr(ctx, "username", "") or "").strip() if ctx else ""
+    if not user:
+        return Response.make(401, b'{"ok":false,"error":"auth"}',
+                             {"Content-Type": "application/json; charset=utf-8"})
+
+    method = flow.request.method.upper()
+    if method == "GET":
+        data = {"ok": True, "lists": _playlists_for_user(user)}
+        return Response.make(200, json.dumps(data, ensure_ascii=False).encode("utf-8"),
+                             {"Content-Type": "application/json; charset=utf-8",
+                              "Cache-Control": "no-store"})
+    if method != "POST":
+        return Response.make(405, b'{"ok":false}', {"Content-Type": "application/json"})
+
+    try:
+        body = json.loads(flow.request.get_text() or "{}")
+    except (ValueError, AttributeError):
+        body = {}
+    action = (body.get("action") or "").strip().lower()
+    now = time.time()
+
+    def _resp(ok: bool, **extras) -> Response:
+        out = {"ok": ok, **extras}
+        return Response.make(200 if ok else 400,
+                             json.dumps(out, ensure_ascii=False).encode("utf-8"),
+                             {"Content-Type": "application/json; charset=utf-8",
+                              "Cache-Control": "no-store"})
+
+    with _PLAYLISTS_LOCK:
+        d = _playlists_load()
+        lists_root = d.setdefault("lists", {})
+        my = lists_root.setdefault(user, [])
+
+        if action == "create":
+            name = (body.get("name") or "").strip()[:60] or "新建列表"
+            pl = {"id": _pl_new_id(), "name": name, "tracks": [],
+                  "created": now, "updated": now}
+            my.append(pl)
+            _playlists_save(d)
+            return _resp(True, list=_pl_normalize(pl))
+
+        if action in ("rename", "delete", "add_track", "remove_track", "reorder", "set_tracks"):
+            pid = (body.get("id") or "").strip()
+            idx = next((i for i, x in enumerate(my) if x.get("id") == pid), -1)
+            if idx < 0:
+                return _resp(False, error="not_found")
+            pl = my[idx]
+
+            if action == "rename":
+                pl["name"] = (body.get("name") or "").strip()[:60] or pl["name"]
+                pl["updated"] = now
+            elif action == "delete":
+                my.pop(idx)
+            elif action == "add_track":
+                rel = (body.get("rel") or "").strip()
+                if rel and rel not in pl["tracks"]:
+                    pl["tracks"].append(rel)
+                    pl["updated"] = now
+            elif action == "remove_track":
+                rel = (body.get("rel") or "").strip()
+                pl["tracks"] = [t for t in pl["tracks"] if t != rel]
+                pl["updated"] = now
+            elif action in ("reorder", "set_tracks"):
+                new_tracks = body.get("tracks") or []
+                if isinstance(new_tracks, list):
+                    pl["tracks"] = [str(t) for t in new_tracks if isinstance(t, str)]
+                    pl["updated"] = now
+            _playlists_save(d)
+            return _resp(True, list=_pl_normalize(pl) if action != "delete" else None)
+
+    return _resp(False, error="unknown_action")
+
+
 # PDF 阅读进度：账号 + 相对路径 → 上次页码
 _PDF_PROG_LOCK = threading.RLock()
 
@@ -7890,6 +8283,8 @@ def _route(flow) -> Response:
             return _music_response(flow)
         if path == "/music_tracks":
             return _music_tracks_response(flow)
+        if path == "/music_playlists":
+            return _playlists_response(flow)
         if path == "/subtitle":
             return _subtitle_response(flow)
         if path == "/subtitle_internal":
