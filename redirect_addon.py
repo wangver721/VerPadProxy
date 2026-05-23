@@ -6655,13 +6655,45 @@ _BROWSER_RUNTIME_JS = r"""
     };
   }catch(e){}
 
-  // 表单 submit
+  // 表单 submit — 浏览器原生 form GET 会丢掉 action URL 上的 query string
+  // 我们必须在 submit 事件里同步构造完整 URL（含 token + form fields）然后 location.href 跳
+  function _collectFormQuery(form){
+    var pairs = [];
+    var els = form.elements;
+    for(var i = 0; i < els.length; i++){
+      var el = els[i];
+      if(!el.name) continue;
+      var t = (el.type || '').toLowerCase();
+      if(t === 'submit' || t === 'reset' || t === 'button' || t === 'file' || t === 'image') continue;
+      if((t === 'checkbox' || t === 'radio') && !el.checked) continue;
+      pairs.push(encodeURIComponent(el.name) + '=' + encodeURIComponent(el.value != null ? el.value : ''));
+    }
+    return pairs.join('&');
+  }
   document.addEventListener('submit', function(ev){
     var f = ev.target;
-    if(!f || !f.action) return;
+    if(!f || f.tagName !== 'FORM') return;
+    if(f.closest && f.closest('#vp-bchrome')) return;
     try{
-      if(!isOurs(f.action) && isHttp(abs(f.action))){
-        f.action = proxify(f.action);
+      // 取 form.action（DOM 属性返回 resolved 绝对 URL，含 token）
+      var action = f.getAttribute('action') || '';
+      if(!action){ action = location.href; }
+      // 不是我们代理的 URL 时先 proxify
+      if(!isOurs(action) && isHttp(abs(action))){
+        action = proxify(action);
+      }
+      // 解析 action 的绝对 URL
+      var actionAbs;
+      try{ actionAbs = new URL(action, location.href).href; }catch(e){ actionAbs = action; }
+      var method = (f.getAttribute('method') || f.method || 'get').toLowerCase();
+      if(method === 'get'){
+        ev.preventDefault();
+        var qs = _collectFormQuery(f);
+        var sep = actionAbs.indexOf('?') >= 0 ? '&' : '?';
+        location.href = actionAbs + (qs ? sep + qs : '');
+      } else {
+        // POST：把 form 的 action 写回代理 URL，让浏览器原生 POST submit 走代理
+        f.action = actionAbs;
       }
     }catch(e){}
   }, true);
