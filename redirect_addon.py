@@ -743,6 +743,8 @@ def _activity_label_for_path(path: str, query: str, decoded_path: str) -> str:
         return "🌐 内置浏览器"
     if p == "/pdf_progress":
         return "📕 同步阅读进度"
+    if p == "/video_progress":
+        return "🎬 同步播放进度"
     if p.startswith("/__admin"):
         return f"🔧 管理面板：{p}"
     return f"{p}"
@@ -4454,6 +4456,19 @@ def _video_probe_compat(path: Path) -> tuple[bool, str]:
     return _video_probe_compat_cached(str(path), path.suffix.lower(), mtime_ns)
 
 
+def _resume_pos_for_video(flow, rel: str) -> float:
+    """从当前账号取该视频的上次播放位置（秒）。0 表示无记忆。"""
+    try:
+        ctx = user_auth.get_user_ctx_from_flow(flow)
+        user = (getattr(ctx, "username", "") or "").strip() if ctx else ""
+        if not user or not rel:
+            return 0.0
+        rec = _video_progress_get(user, rel)
+        return float(rec["pos"]) if rec else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def _video_response(flow, path: Path) -> Response:
     rel = _rel_of(path)
     rel_q = _q(path)
@@ -4798,6 +4813,47 @@ def _video_response(flow, path: Path) -> Response:
   var NEEDS_TRANS = {('true' if needs_transcode else 'false')};
   var TRANS_PATH = {json.dumps(_obfuscate(rel))};
   var HLS_URL = {json.dumps(hls_url)};
+  // 播放进度记忆（按账号）— 上次播放到哪秒
+  var SAVED_POS = {json.dumps(_resume_pos_for_video(flow, rel))};
+  var REL_TOKEN = {json.dumps(_obfuscate(rel))};
+
+  (function setupVideoProgress(){{
+    if (!v) return;
+    var jumped = false;
+    function jumpOnce(){{
+      if (jumped) return;
+      if (!SAVED_POS || SAVED_POS < 3) return;  // <3 秒不需要恢复
+      if (!isFinite(v.duration) || v.duration <= 0) return;
+      try{{ v.currentTime = Math.min(SAVED_POS, Math.max(0, v.duration - 2)); jumped = true; }}catch(e){{}}
+    }}
+    v.addEventListener('loadedmetadata', jumpOnce);
+    v.addEventListener('durationchange', jumpOnce);
+    v.addEventListener('canplay', jumpOnce);
+
+    function report(){{
+      try{{
+        var pos = v.currentTime || 0;
+        var dur = isFinite(v.duration) ? v.duration : 0;
+        if (pos <= 0) return;
+        fetch('/video_progress', {{
+          method:'POST', credentials:'include',
+          headers:{{'Content-Type':'application/json'}},
+          body: JSON.stringify({{path: REL_TOKEN, pos: pos, dur: dur}}),
+          keepalive: true
+        }}).catch(function(){{}});
+      }}catch(e){{}}
+    }}
+    // 每 5 秒上报一次（播放中才报）
+    setInterval(function(){{ if (v && !v.paused && !v.ended) report(); }}, 5000);
+    // 暂停 / 拖动后 / 离开页面时立刻上报
+    v.addEventListener('pause', report);
+    v.addEventListener('seeked', report);
+    window.addEventListener('pagehide', report);
+    window.addEventListener('beforeunload', report);
+    document.addEventListener('visibilitychange', function(){{
+      if (document.visibilityState === 'hidden') report();
+    }});
+  }})();
   var overlay = document.getElementById('trans-overlay');
   var fillEl = document.getElementById('trans-fill');
   var msgEl = document.getElementById('trans-msg');
@@ -8138,6 +8194,104 @@ def _playlists_response(flow) -> Response:
     return _resp(False, error="unknown_action")
 
 
+# ---------------------------------------------------------------------------
+# 视频播放记忆：账号 + 相对路径 → {pos, dur, updated}
+# ---------------------------------------------------------------------------
+_VIDEO_PROG_LOCK = threading.RLock()
+
+
+def _video_progress_path() -> Path:
+    env = (os.environ.get("MITM_DATA_DIR", "") or "").strip()
+    base = Path(env).expanduser().resolve() if env else _BASE
+    return base / "mitm_video_progress.json"
+
+
+def _video_progress_load() -> dict:
+    p = _video_progress_path()
+    if not p.is_file():
+        return {}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8") or "{}")
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _video_progress_save(data: dict) -> None:
+    p = _video_progress_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp.replace(p)
+    except OSError:
+        pass
+
+
+def _video_progress_get(user: str, rel: str) -> dict | None:
+    """返回 {'pos': float, 'dur': float, 'updated': float} 或 None。"""
+    if not user or not rel:
+        return None
+    with _VIDEO_PROG_LOCK:
+        d = _video_progress_load()
+        u = d.get(user) or {}
+        v = u.get(rel)
+        if not isinstance(v, dict):
+            return None
+        try:
+            pos = float(v.get("pos") or 0)
+        except (TypeError, ValueError):
+            return None
+        if pos <= 0:
+            return None
+        return {
+            "pos": pos,
+            "dur": float(v.get("dur") or 0),
+            "updated": float(v.get("updated") or 0),
+        }
+
+
+def _video_progress_set(user: str, rel: str, pos: float, dur: float) -> None:
+    if not user or not rel or pos <= 0:
+        return
+    # 接近片尾 5 秒就认为看完了，删进度
+    finished = (dur > 5 and pos > dur - 5)
+    with _VIDEO_PROG_LOCK:
+        d = _video_progress_load()
+        u = d.setdefault(user, {})
+        if finished:
+            u.pop(rel, None)
+        else:
+            u[rel] = {"pos": float(pos), "dur": float(dur or 0), "updated": time.time()}
+        _video_progress_save(d)
+
+
+def _video_progress_response(flow) -> Response:
+    """前端 fetch('/video_progress', {method:POST, body:{path, pos, dur}}) 上报。"""
+    if flow.request.method.upper() != "POST":
+        return Response.make(405, b"", {"Content-Type": "text/plain"})
+    ctx = user_auth.get_user_ctx_from_flow(flow)
+    user = (getattr(ctx, "username", "") or "").strip() if ctx else ""
+    if not user:
+        return Response.make(401, b'{"ok":false,"error":"auth"}',
+                             {"Content-Type": "application/json"})
+    try:
+        data = json.loads(flow.request.get_text() or "{}")
+    except (ValueError, AttributeError):
+        data = {}
+    rel = (data.get("path") or "").strip()
+    rel = _unobfuscate(rel)
+    try:
+        pos = float(data.get("pos") or 0)
+        dur = float(data.get("dur") or 0)
+    except (TypeError, ValueError):
+        return Response.make(400, b'{"ok":false}', {"Content-Type": "application/json"})
+    _video_progress_set(user, rel, pos, dur)
+    return Response.make(200, b'{"ok":true}',
+                         {"Content-Type": "application/json", "Cache-Control": "no-store"})
+
+
 # PDF 阅读进度：账号 + 相对路径 → 上次页码
 _PDF_PROG_LOCK = threading.RLock()
 
@@ -8313,6 +8467,8 @@ def _route(flow) -> Response:
             if p is None:
                 return _error_page("未找到视频/音频。")
             return _video_response(flow, p)
+        if path == "/video_progress":
+            return _video_progress_response(flow)
         if path == "/video_trans_status":
             return _video_trans_status_response(flow)
         if path == "/video_trans_clear":
