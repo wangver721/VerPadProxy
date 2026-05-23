@@ -6546,6 +6546,59 @@ _BROWSER_RUNTIME_JS = r"""
     };
   }catch(e){}
 
+  // Image() / Audio() 构造函数：new Image() + img.src = '...' 会绕过 src setter？
+  // 不会（已 patch HTMLImageElement.prototype.src setter），但保留兼容
+  // new Image(width, height, src) 这种把 src 作为第三参数的形式很少见，可忽略
+
+  // WebSocket 构造函数 — 后台连接也走 mitmproxy？技术上 mitmproxy 不直接转 WS
+  // 这里只是把 wss:// 直接禁用（防止 ForClass 拦），不影响主流程
+  try{
+    var _WS = window.WebSocket;
+    if(_WS){
+      window.WebSocket = function(url, protocols){
+        // 受限平板很可能不允许 ws/wss 跨站，直接抛错让 SPA 走 fallback
+        throw new Error('WebSocket blocked in restricted browser mode');
+      };
+      // 保留原型 / 静态字段，避免 instanceof 检查炸
+      try{
+        window.WebSocket.prototype = _WS.prototype;
+        window.WebSocket.CONNECTING = _WS.CONNECTING;
+        window.WebSocket.OPEN = _WS.OPEN;
+        window.WebSocket.CLOSING = _WS.CLOSING;
+        window.WebSocket.CLOSED = _WS.CLOSED;
+      }catch(e){}
+    }
+  }catch(e){}
+
+  // EventSource（SSE）同样禁用
+  try{ window.EventSource = function(){ throw new Error('EventSource blocked'); }; }catch(e){}
+
+  // Worker / SharedWorker / ServiceWorker：直接屏蔽 — 这些会发独立请求绕过代理
+  try{ window.Worker = function(){ throw new Error('Worker blocked'); }; }catch(e){}
+  try{ window.SharedWorker = function(){ throw new Error('SharedWorker blocked'); }; }catch(e){}
+  try{
+    if(navigator.serviceWorker){
+      Object.defineProperty(navigator, 'serviceWorker', {
+        value: { register: function(){ return Promise.reject(new Error('blocked')); },
+                 ready: new Promise(function(){}),
+                 controller: null,
+                 addEventListener: function(){}, removeEventListener: function(){} },
+        configurable: true
+      });
+    }
+  }catch(e){}
+
+  // navigator.sendBeacon：也用 fetch 跑，转代理
+  try{
+    if(navigator.sendBeacon){
+      var _beacon = navigator.sendBeacon.bind(navigator);
+      navigator.sendBeacon = function(url, data){
+        try{ url = proxify(url); }catch(e){}
+        return _beacon(url, data);
+      };
+    }
+  }catch(e){}
+
   // fetch
   try{
     var _f = window.fetch;
@@ -7027,6 +7080,59 @@ def _browser_fetch_url(url: str, user: str = "") -> tuple[bytes, str, str]:
         _sock.getaddrinfo = _orig_gai  # type: ignore[assignment]
 
 
+def _browser_cache_dir() -> Path:
+    env = (os.environ.get("MITM_DATA_DIR", "") or "").strip()
+    base = Path(env).expanduser().resolve() if env else _BASE
+    d = base / "browser_cache"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _browser_cache_get(url: str) -> tuple[bytes, str] | None:
+    """静态资源磁盘缓存：图片/字体/CSS/JS 命中直接返回，省手机流量。"""
+    key = hashlib.sha1(url.encode("utf-8")).hexdigest()
+    d = _browser_cache_dir()
+    body_p = d / (key + ".bin")
+    meta_p = d / (key + ".json")
+    if not body_p.is_file() or not meta_p.is_file():
+        return None
+    try:
+        meta = json.loads(meta_p.read_text(encoding="utf-8"))
+        ctype = str(meta.get("ctype") or "application/octet-stream")
+        body = body_p.read_bytes()
+        return body, ctype
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _browser_cache_put(url: str, body: bytes, ctype: str) -> None:
+    """把可缓存的响应写入磁盘。html/json 等不缓存。"""
+    if not body:
+        return
+    low = (ctype or "").lower()
+    cacheable = (
+        low.startswith(("image/", "font/", "video/", "audio/"))
+        or "javascript" in low or "css" in low
+    )
+    if not cacheable:
+        return
+    if len(body) > 5 * 1024 * 1024:  # 单文件 5MB 上限
+        return
+    key = hashlib.sha1(url.encode("utf-8")).hexdigest()
+    d = _browser_cache_dir()
+    try:
+        (d / (key + ".bin")).write_bytes(body)
+        (d / (key + ".json")).write_text(
+            json.dumps({"ctype": ctype, "url": url, "ts": int(time.time())}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def _browser_proxy_response(flow) -> Response:
     # 优先看加密 token u；fallback 看明文 url（向后兼容）。
     raw = _query_first(flow, "u", default="")
@@ -7042,6 +7148,17 @@ def _browser_proxy_response(flow) -> Response:
     # bypass 会让 Pad 直连外站 host，URL 露出 bilibili.com 立刻被拦。
     # 让所有请求只走 mitmproxy origin（zzn.forclass.net），
     # 由 _browser_referer_fallback 通过 Referer 反推处理子资源。
+
+    # 优先查磁盘缓存（仅静态资源）
+    cached = _browser_cache_get(target_url)
+    if cached is not None:
+        body, ctype = cached
+        return Response.make(200, body, {
+            "Content-Type": ctype,
+            "Cache-Control": "public, max-age=3600",
+            "X-VP-Cache": "HIT",
+        })
+
     # 多用户隔离：取当前账号名作为 cookie jar 维度
     try:
         ctx_user = user_auth.get_user_ctx_from_flow(flow)
@@ -7089,13 +7206,62 @@ def _browser_proxy_response(flow) -> Response:
         body = text.encode("utf-8")
         headers["Content-Type"] = "text/css; charset=utf-8"
         headers["Cache-Control"] = "public, max-age=300"
+    elif "mpegurl" in low_ct or "vnd.apple.mpegurl" in low_ct or target_url.endswith((".m3u8", ".m3u")):
+        # HLS 播放列表：里面的 ts/m4s 分片 URL 改写成代理
+        try:
+            text = body.decode("utf-8", errors="replace")
+            text = _rewrite_m3u8(text, target_url)
+            body = text.encode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            pass
+        headers["Content-Type"] = "application/vnd.apple.mpegurl"
+        headers["Cache-Control"] = "no-store"
     else:
         headers["Content-Type"] = ctype
         if low_ct.startswith(("image/", "font/")) or "javascript" in low_ct or low_ct.startswith("video/") or low_ct.startswith("audio/"):
             headers["Cache-Control"] = "public, max-age=300"
         else:
             headers["Cache-Control"] = "no-store"
+    # 静态资源写入磁盘缓存：下次同 URL 直接 HIT 不再过手机网络
+    try:
+        _browser_cache_put(target_url, body, headers.get("Content-Type", ctype))
+    except Exception:  # noqa: BLE001
+        pass
     return Response.make(200, body, headers)
+
+
+def _rewrite_m3u8(text: str, page_url: str) -> str:
+    """HLS m3u8 改写：把每行的 .ts / .m4s URI 和 #EXT-X-KEY URI=... 都代理化。"""
+    out_lines: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            out_lines.append(line)
+            continue
+        if s.startswith("#"):
+            # 处理 #EXT-X-KEY:URI="..." / #EXT-X-MAP:URI="..."
+            def _key_repl(m: re.Match[str]) -> str:
+                url = m.group(2)
+                try:
+                    abs_u = urljoin(page_url, url)
+                except (TypeError, ValueError):
+                    abs_u = url
+                if abs_u.startswith(("http://", "https://")):
+                    return m.group(1) + _browser_proxify_url(abs_u) + '"'
+                return m.group(0)
+            line = re.sub(r'(URI=")([^"]+)(")', _key_repl, line)
+            out_lines.append(line)
+            continue
+        # 数据行（分片 URI）
+        try:
+            abs_u = urljoin(page_url, s)
+        except (TypeError, ValueError):
+            abs_u = s
+        if abs_u.startswith(("http://", "https://")):
+            out_lines.append(_browser_proxify_url(abs_u))
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines) + ("\n" if text.endswith("\n") else "")
 
 
 def _browser_referer_fallback(flow):
