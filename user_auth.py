@@ -69,12 +69,13 @@ def _persist_sessions_locked() -> None:
 # 各功能是否可见/可用（管理员默认全开）
 FE_KEYS = (
     "fe_home", "fe_pdf", "fe_video", "fe_music", "fe_upload", "fe_browse",
-    "fe_upl", "fe_private", "fe_image", "fe_text", "fe_browser",
+    "fe_upl", "fe_private", "fe_image", "fe_text", "fe_browser", "fe_chat",
 )
 DEFAULT_FEATURES = {k: True for k in FE_KEYS}
 DEFAULT_FEATURES["fe_upl"] = True
 DEFAULT_FEATURES["fe_private"] = False
 DEFAULT_FEATURES["fe_browser"] = False  # 浏览器直跳默认关闭：会让 host 进白名单透传，谨慎授权
+DEFAULT_FEATURES["fe_chat"] = True  # 即时通讯默认开启
 
 
 @dataclass
@@ -409,6 +410,33 @@ def is_admin_name(username: str) -> bool:
         store = _read_store_unlocked()
         r = (store.get("users") or {}).get(username) or {}
         return (r.get("role") or "").lower() == "admin"
+
+
+def list_usernames(*, include_banned: bool = False) -> list[dict]:
+    """列出所有用户（供通讯录用）。返回 [{username, role, banned}, ...]，按用户名排序。"""
+    with _LOCK:
+        _ensure_bootstrap()
+        store = _read_store_unlocked()
+        out: list[dict] = []
+        for un, rec in (store.get("users") or {}).items():
+            if not isinstance(rec, dict):
+                continue
+            banned = bool(rec.get("banned"))
+            if banned and not include_banned:
+                continue
+            out.append({
+                "username": un,
+                "role": (rec.get("role") or "user").lower(),
+                "banned": banned,
+            })
+    out.sort(key=lambda x: x["username"].lower())
+    return out
+
+
+def user_exists(username: str) -> bool:
+    with _LOCK:
+        store = _read_store_unlocked()
+        return username in (store.get("users") or {})
 
 
 # ---------------------------------------------------------------------------

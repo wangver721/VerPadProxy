@@ -523,6 +523,10 @@ def _feature_gate_response(flow, path: str, ctx: user_auth.UserCtx) -> Response 
         if not user_auth.feature_allowed(ctx, "fe_browser"):
             return _error_page("无权使用内置浏览器。该功能默认关闭，请联系管理员授权。", status=403)
         return None
+    if path == "/chat" or path.startswith("/chat/"):
+        if not user_auth.feature_allowed(ctx, "fe_chat"):
+            return _error_page("无权使用通讯功能。", status=403)
+        return None
     if path == "/browse":
         rel = _query_first(flow, "path", "dir", "mitm_path")
         r = (rel or "").replace("\\", "/").strip().lstrip("/")
@@ -690,6 +694,7 @@ _FE_LABELS: dict[str, str] = {
     "fe_image": "图片",
     "fe_text": "文本",
     "fe_browser": "内置浏览器：多标签 + 手机代拉网页转发（默认关闭，谨慎授权）",
+    "fe_chat": "即时通讯：与其他用户互发消息",
 }
 
 
@@ -745,6 +750,14 @@ def _activity_label_for_path(path: str, query: str, decoded_path: str) -> str:
         return "📕 同步阅读进度"
     if p == "/video_progress":
         return "🎬 同步播放进度"
+    if p == "/chat":
+        return "💬 通讯"
+    if p == "/chat/poll":
+        return "💬 收消息"
+    if p == "/chat/send":
+        return "💬 发消息"
+    if p == "/chat/contacts":
+        return "💬 通讯录"
     if p.startswith("/__admin"):
         return f"🔧 管理面板：{p}"
     return f"{p}"
@@ -2536,6 +2549,8 @@ def _home_response(flow) -> Response:
             parts_t.append(_tile('/browse', '📁', '全部文件', '文件浏览器'))
         if user_auth.feature_allowed(ctx, "fe_browser"):
             parts_t.append(_tile('/browser', '🌐', '浏览器', ''))
+        if user_auth.feature_allowed(ctx, "fe_chat"):
+            parts_t.append(_tile('/chat', '💬', '通讯', '与其他用户聊天'))
     grid_inner = "".join(parts_t) if parts_t else '<div class="card" style="grid-column:1/-1"><p class="muted" style="margin:0">当前账号未开启任何入口，请联系管理员。</p></div>'
     nav: list[str] = ['<span class="spacer"></span>']
     if ctx is not None:
@@ -8292,6 +8307,347 @@ def _video_progress_response(flow) -> Response:
                          {"Content-Type": "application/json", "Cache-Control": "no-store"})
 
 
+# ---------------------------------------------------------------------------
+# 即时通讯：用户间私聊
+# ---------------------------------------------------------------------------
+# 存储结构 mitm_chat.json：
+# {
+#   "version": 1,
+#   "seq": 1234,                       # 全局自增消息 id
+#   "msgs": {
+#     "alice\u0000bob": [               # 会话键 = 两个用户名排序后用 \0 连接
+#       {"id":1, "from":"alice", "to":"bob", "text":"hi", "ts":1234.5}
+#     ]
+#   },
+#   "read": {"alice": {"alice\u0000bob": 12}}  # 每个用户在每个会话已读到的最大 msg id
+# }
+_CHAT_LOCK = threading.RLock()
+_CHAT_MAX_PER_CONV = 500       # 每个会话最多保留的消息数
+_CHAT_MAX_TEXT = 4000          # 单条消息最大字符
+
+
+def _chat_path() -> Path:
+    env = (os.environ.get("MITM_DATA_DIR", "") or "").strip()
+    base = Path(env).expanduser().resolve() if env else _BASE
+    return base / "mitm_chat.json"
+
+
+def _chat_load() -> dict:
+    p = _chat_path()
+    if not p.is_file():
+        return {"version": 1, "seq": 0, "msgs": {}, "read": {}}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8") or "{}")
+        if not isinstance(d, dict):
+            return {"version": 1, "seq": 0, "msgs": {}, "read": {}}
+        d.setdefault("seq", 0)
+        d.setdefault("msgs", {})
+        d.setdefault("read", {})
+        return d
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {"version": 1, "seq": 0, "msgs": {}, "read": {}}
+
+
+def _chat_save(data: dict) -> None:
+    p = _chat_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False)
+        tmp.replace(p)
+    except OSError:
+        pass
+
+
+def _conv_key(a: str, b: str) -> str:
+    return "\u0000".join(sorted([a, b]))
+
+
+def _chat_contacts_response(flow) -> Response:
+    """通讯录：所有其他用户 + 每个会话未读数 + 最近一条消息预览。"""
+    ctx = user_auth.get_user_ctx_from_flow(flow)
+    me = (getattr(ctx, "username", "") or "").strip() if ctx else ""
+    if not me:
+        return Response.make(401, b'{"ok":false}', {"Content-Type": "application/json"})
+    users = user_auth.list_usernames()
+    with _CHAT_LOCK:
+        d = _chat_load()
+        msgs = d.get("msgs", {})
+        read = d.get("read", {}).get(me, {})
+        contacts = []
+        for u in users:
+            un = u["username"]
+            if un == me:
+                continue
+            ck = _conv_key(me, un)
+            conv = msgs.get(ck, [])
+            last = conv[-1] if conv else None
+            read_id = int(read.get(ck, 0))
+            unread = sum(1 for m in conv if int(m.get("id", 0)) > read_id and m.get("from") != me)
+            contacts.append({
+                "username": un,
+                "role": u["role"],
+                "unread": unread,
+                "last_text": (last.get("text", "")[:40] if last else ""),
+                "last_ts": (last.get("ts", 0) if last else 0),
+                "last_from": (last.get("from", "") if last else ""),
+            })
+    # 有消息的排前面，按最近时间倒序；其余按名字
+    contacts.sort(key=lambda c: (-(c["last_ts"] or 0), c["username"].lower()))
+    body = json.dumps({"ok": True, "me": me, "contacts": contacts}, ensure_ascii=False).encode("utf-8")
+    return Response.make(200, body, {"Content-Type": "application/json; charset=utf-8",
+                                     "Cache-Control": "no-store"})
+
+
+def _chat_poll_response(flow) -> Response:
+    """拉取与某个对端的消息；since=最后已知 msg id，只返回更新的部分。"""
+    ctx = user_auth.get_user_ctx_from_flow(flow)
+    me = (getattr(ctx, "username", "") or "").strip() if ctx else ""
+    if not me:
+        return Response.make(401, b'{"ok":false}', {"Content-Type": "application/json"})
+    peer = (_query_first(flow, "peer") or "").strip()
+    try:
+        since = int(_query_first(flow, "since") or "0")
+    except (TypeError, ValueError):
+        since = 0
+    if not peer or not user_auth.user_exists(peer):
+        return Response.make(400, b'{"ok":false,"error":"bad_peer"}',
+                             {"Content-Type": "application/json"})
+    ck = _conv_key(me, peer)
+    with _CHAT_LOCK:
+        d = _chat_load()
+        conv = d.get("msgs", {}).get(ck, [])
+        new_msgs = [m for m in conv if int(m.get("id", 0)) > since]
+        # 标记已读到当前会话最大 id
+        if conv:
+            max_id = max(int(m.get("id", 0)) for m in conv)
+            d.setdefault("read", {}).setdefault(me, {})[ck] = max_id
+            _chat_save(d)
+    body = json.dumps({"ok": True, "messages": new_msgs}, ensure_ascii=False).encode("utf-8")
+    return Response.make(200, body, {"Content-Type": "application/json; charset=utf-8",
+                                     "Cache-Control": "no-store"})
+
+
+def _chat_send_response(flow) -> Response:
+    ctx = user_auth.get_user_ctx_from_flow(flow)
+    me = (getattr(ctx, "username", "") or "").strip() if ctx else ""
+    if not me:
+        return Response.make(401, b'{"ok":false}', {"Content-Type": "application/json"})
+    if flow.request.method.upper() != "POST":
+        return Response.make(405, b'{"ok":false}', {"Content-Type": "application/json"})
+    try:
+        data = json.loads(flow.request.get_text() or "{}")
+    except (ValueError, AttributeError):
+        data = {}
+    peer = (data.get("peer") or "").strip()
+    text = (data.get("text") or "").strip()
+    if not peer or not user_auth.user_exists(peer) or peer == me:
+        return Response.make(400, b'{"ok":false,"error":"bad_peer"}',
+                             {"Content-Type": "application/json"})
+    if not text:
+        return Response.make(400, b'{"ok":false,"error":"empty"}',
+                             {"Content-Type": "application/json"})
+    text = text[:_CHAT_MAX_TEXT]
+    ck = _conv_key(me, peer)
+    with _CHAT_LOCK:
+        d = _chat_load()
+        d["seq"] = int(d.get("seq", 0)) + 1
+        msg = {"id": d["seq"], "from": me, "to": peer, "text": text, "ts": time.time()}
+        conv = d.setdefault("msgs", {}).setdefault(ck, [])
+        conv.append(msg)
+        # 截断历史
+        if len(conv) > _CHAT_MAX_PER_CONV:
+            del conv[: len(conv) - _CHAT_MAX_PER_CONV]
+        # 发送者自己已读到这条
+        d.setdefault("read", {}).setdefault(me, {})[ck] = d["seq"]
+        _chat_save(d)
+    body = json.dumps({"ok": True, "message": msg}, ensure_ascii=False).encode("utf-8")
+    return Response.make(200, body, {"Content-Type": "application/json; charset=utf-8",
+                                     "Cache-Control": "no-store"})
+
+
+def _chat_page_response(flow) -> Response:
+    ctx = user_auth.get_user_ctx_from_flow(flow)
+    me = (getattr(ctx, "username", "") or "").strip() if ctx else ""
+    me_js = json.dumps(me)
+    body = r"""
+<style>
+.app:has(.chat-page){min-height:100dvh;max-height:100dvh;overflow:hidden}
+.chat-page{display:flex;flex-direction:column;height:100dvh;height:100vh;max-width:100%!important;padding:0!important}
+.chat-top{flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(18,22,34,.92);border-bottom:1px solid var(--line)}
+.chat-top .brand{font-weight:800;font-size:1rem}
+.chat-top .me{margin-left:auto;color:var(--muted);font-size:.82rem}
+.chat-body{flex:1;min-height:0;display:flex;overflow:hidden}
+.chat-contacts{flex:0 0 38%;max-width:320px;min-width:0;border-right:1px solid var(--line);display:flex;flex-direction:column;background:rgba(12,16,24,.4)}
+.contacts-head{padding:10px 14px;font-size:.8rem;font-weight:600;color:var(--muted);border-bottom:1px solid var(--line)}
+.contacts-scroll{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.contact{display:flex;align-items:center;gap:10px;padding:11px 14px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.05)}
+.contact.active{background:rgba(95,161,255,.16)}
+.contact .ava{flex:0 0 38px;width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#5fa1ff,#b97cff);display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;font-size:1rem}
+.contact .c-info{flex:1;min-width:0}
+.contact .c-name{font-weight:600;font-size:.9rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.contact .c-last{font-size:.76rem;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.contact .c-badge{flex:0 0 auto;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:#ff4d6d;color:#fff;font-size:.7rem;font-weight:700;display:none;align-items:center;justify-content:center}
+.contact .c-badge.show{display:inline-flex}
+.chat-conv{flex:1;min-width:0;display:flex;flex-direction:column;background:#0c0e14}
+.conv-head{flex:0 0 auto;padding:12px 16px;font-weight:700;border-bottom:1px solid var(--line);background:rgba(18,22,34,.6)}
+.conv-scroll{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:14px;display:flex;flex-direction:column;gap:8px}
+.msg{max-width:74%;padding:8px 12px;border-radius:14px;font-size:.92rem;line-height:1.45;word-break:break-word;white-space:pre-wrap}
+.msg.mine{align-self:flex-end;background:linear-gradient(135deg,#5fa1ff,#6f86ff);color:#fff;border-bottom-right-radius:4px}
+.msg.theirs{align-self:flex-start;background:rgba(255,255,255,.1);color:#eef2ff;border-bottom-left-radius:4px}
+.msg .t{display:block;font-size:.66rem;opacity:.6;margin-top:3px;text-align:right}
+.conv-empty{margin:auto;color:var(--muted);font-size:.9rem;text-align:center;padding:20px}
+.conv-input{flex:0 0 auto;display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line);background:rgba(18,22,34,.6)}
+.conv-input textarea{flex:1;min-width:0;resize:none;height:42px;max-height:120px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.2);background:rgba(0,0,0,.3);color:#fff;font-size:.92rem;outline:none;font-family:inherit}
+.conv-input textarea:focus{border-color:#9dd1ff}
+.conv-input button{flex:0 0 auto;min-width:60px;border-radius:12px;border:none;background:linear-gradient(135deg,#5fa1ff,#b97cff);color:#fff;font-weight:700;font-size:.92rem;cursor:pointer}
+.conv-input button:disabled{opacity:.5}
+@media (max-width:760px){
+  .chat-contacts{flex-basis:100%;max-width:none}
+  .chat-conv{display:none}
+  .chat-page.show-conv .chat-contacts{display:none}
+  .chat-page.show-conv .chat-conv{display:flex;flex-basis:100%}
+  .conv-head .back{margin-right:10px;cursor:pointer}
+}
+.conv-head .back{display:none}
+@media (max-width:760px){.conv-head .back{display:inline}}
+</style>
+<div class="chat-page" id="chat-page">
+  <div class="chat-top">
+    <a class="btn btn-ghost btn-sm" href="/">🏠</a>
+    <span class="brand">💬 通讯</span>
+    <span class="me" id="chat-me"></span>
+  </div>
+  <div class="chat-body">
+    <div class="chat-contacts">
+      <div class="contacts-head">联系人</div>
+      <div class="contacts-scroll" id="contacts"></div>
+    </div>
+    <div class="chat-conv">
+      <div class="conv-head"><span class="back" id="conv-back">‹ </span><span id="conv-title">选择联系人开始聊天</span></div>
+      <div class="conv-scroll" id="conv"><div class="conv-empty">从左侧选择一位联系人</div></div>
+      <div class="conv-input">
+        <textarea id="msg-input" placeholder="输入消息…" disabled></textarea>
+        <button id="msg-send" disabled>发送</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  var ME = __CHAT_ME__;
+  document.getElementById('chat-me').textContent = ME ? ('@' + ME) : '';
+  var elContacts = document.getElementById('contacts');
+  var elConv = document.getElementById('conv');
+  var elTitle = document.getElementById('conv-title');
+  var elInput = document.getElementById('msg-input');
+  var elSend = document.getElementById('msg-send');
+  var elPage = document.getElementById('chat-page');
+  var peer = '';
+  var lastId = 0;
+  var seen = {};         // 已渲染的 msg id，去重
+  var contactsCache = [];
+
+  function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
+  function fmtTime(ts){
+    if(!ts) return '';
+    var d = new Date(ts*1000), now = new Date();
+    var hh = ('0'+d.getHours()).slice(-2), mm = ('0'+d.getMinutes()).slice(-2);
+    if(d.toDateString() === now.toDateString()) return hh+':'+mm;
+    return (d.getMonth()+1)+'/'+d.getDate()+' '+hh+':'+mm;
+  }
+
+  function renderContacts(list){
+    contactsCache = list;
+    var html = '';
+    list.forEach(function(c){
+      var initial = (c.username||'?').charAt(0).toUpperCase();
+      var preview = c.last_text ? ((c.last_from===ME?'我: ':'')+c.last_text) : '';
+      html += '<div class="contact'+(c.username===peer?' active':'')+'" data-u="'+esc(c.username)+'">'
+           +  '<div class="ava">'+esc(initial)+'</div>'
+           +  '<div class="c-info"><div class="c-name">'+esc(c.username)+(c.role==='admin'?' 👑':'')+'</div>'
+           +  '<div class="c-last">'+esc(preview)+'</div></div>'
+           +  '<div class="c-badge'+(c.unread>0?' show':'')+'">'+(c.unread>99?'99+':c.unread)+'</div>'
+           +  '</div>';
+    });
+    elContacts.innerHTML = html || '<div class="conv-empty">暂无其他用户</div>';
+    elContacts.querySelectorAll('.contact').forEach(function(el){
+      el.addEventListener('click', function(){ openConv(el.getAttribute('data-u')); });
+    });
+  }
+
+  function loadContacts(){
+    return fetch('/chat/contacts', {credentials:'include'}).then(function(r){return r.ok?r.json():null;})
+      .then(function(d){ if(d&&d.ok) renderContacts(d.contacts||[]); }).catch(function(){});
+  }
+
+  function appendMsgs(msgs){
+    var atBottom = (elConv.scrollHeight - elConv.scrollTop - elConv.clientHeight) < 60;
+    msgs.forEach(function(m){
+      if(seen[m.id]) return;
+      seen[m.id] = 1;
+      lastId = Math.max(lastId, m.id);
+      var div = document.createElement('div');
+      div.className = 'msg ' + (m.from===ME ? 'mine':'theirs');
+      div.innerHTML = esc(m.text) + '<span class="t">'+fmtTime(m.ts)+'</span>';
+      elConv.appendChild(div);
+    });
+    if(atBottom){ elConv.scrollTop = elConv.scrollHeight; }
+  }
+
+  function openConv(u){
+    if(!u) return;
+    peer = u; lastId = 0; seen = {};
+    elTitle.textContent = u;
+    elConv.innerHTML = '';
+    elInput.disabled = false; elSend.disabled = false;
+    elPage.classList.add('show-conv');
+    renderContacts(contactsCache);
+    pollConv(true);
+  }
+
+  function pollConv(scroll){
+    if(!peer) return;
+    fetch('/chat/poll?peer='+encodeURIComponent(peer)+'&since='+lastId, {credentials:'include'})
+      .then(function(r){return r.ok?r.json():null;})
+      .then(function(d){
+        if(d&&d.ok&&d.messages&&d.messages.length){
+          appendMsgs(d.messages);
+          if(scroll) elConv.scrollTop = elConv.scrollHeight;
+        }
+      }).catch(function(){});
+  }
+
+  function send(){
+    var text = (elInput.value||'').trim();
+    if(!text||!peer) return;
+    elInput.value = '';
+    fetch('/chat/send', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({peer:peer,text:text})})
+      .then(function(r){return r.ok?r.json():null;})
+      .then(function(d){ if(d&&d.ok&&d.message){ appendMsgs([d.message]); elConv.scrollTop=elConv.scrollHeight; } })
+      .catch(function(){});
+  }
+
+  elSend.addEventListener('click', send);
+  elInput.addEventListener('keydown', function(e){
+    if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); }
+  });
+  document.getElementById('conv-back').addEventListener('click', function(){
+    elPage.classList.remove('show-conv'); peer=''; loadContacts();
+  });
+
+  // 轮询：会话每 2 秒，通讯录每 5 秒
+  loadContacts();
+  setInterval(function(){ if(peer) pollConv(false); }, 2000);
+  setInterval(loadContacts, 5000);
+})();
+</script>"""
+    body = body.replace("__CHAT_ME__", me_js)
+    return _html_response(_shell("通讯", body, mini_player=False))
+
+
 # PDF 阅读进度：账号 + 相对路径 → 上次页码
 _PDF_PROG_LOCK = threading.RLock()
 
@@ -8439,6 +8795,14 @@ def _route(flow) -> Response:
             return _music_tracks_response(flow)
         if path == "/music_playlists":
             return _playlists_response(flow)
+        if path == "/chat":
+            return _chat_page_response(flow)
+        if path == "/chat/contacts":
+            return _chat_contacts_response(flow)
+        if path == "/chat/poll":
+            return _chat_poll_response(flow)
+        if path == "/chat/send":
+            return _chat_send_response(flow)
         if path == "/subtitle":
             return _subtitle_response(flow)
         if path == "/subtitle_internal":
