@@ -8429,6 +8429,24 @@ def _chat_poll_response(flow) -> Response:
                                      "Cache-Control": "no-store"})
 
 
+def _chat_append_msg(me: str, peer: str, text: str, media: dict | None) -> dict:
+    """追加一条消息（可带 media），返回消息对象。调用方需保证 peer 合法。"""
+    ck = _conv_key(me, peer)
+    with _CHAT_LOCK:
+        d = _chat_load()
+        d["seq"] = int(d.get("seq", 0)) + 1
+        msg = {"id": d["seq"], "from": me, "to": peer, "text": text, "ts": time.time()}
+        if media:
+            msg["media"] = media
+        conv = d.setdefault("msgs", {}).setdefault(ck, [])
+        conv.append(msg)
+        if len(conv) > _CHAT_MAX_PER_CONV:
+            del conv[: len(conv) - _CHAT_MAX_PER_CONV]
+        d.setdefault("read", {}).setdefault(me, {})[ck] = d["seq"]
+        _chat_save(d)
+    return msg
+
+
 def _chat_send_response(flow) -> Response:
     ctx = user_auth.get_user_ctx_from_flow(flow)
     me = (getattr(ctx, "username", "") or "").strip() if ctx else ""
@@ -8448,23 +8466,118 @@ def _chat_send_response(flow) -> Response:
     if not text:
         return Response.make(400, b'{"ok":false,"error":"empty"}',
                              {"Content-Type": "application/json"})
-    text = text[:_CHAT_MAX_TEXT]
-    ck = _conv_key(me, peer)
-    with _CHAT_LOCK:
-        d = _chat_load()
-        d["seq"] = int(d.get("seq", 0)) + 1
-        msg = {"id": d["seq"], "from": me, "to": peer, "text": text, "ts": time.time()}
-        conv = d.setdefault("msgs", {}).setdefault(ck, [])
-        conv.append(msg)
-        # 截断历史
-        if len(conv) > _CHAT_MAX_PER_CONV:
-            del conv[: len(conv) - _CHAT_MAX_PER_CONV]
-        # 发送者自己已读到这条
-        d.setdefault("read", {}).setdefault(me, {})[ck] = d["seq"]
-        _chat_save(d)
+    msg = _chat_append_msg(me, peer, text[:_CHAT_MAX_TEXT], None)
     body = json.dumps({"ok": True, "message": msg}, ensure_ascii=False).encode("utf-8")
     return Response.make(200, body, {"Content-Type": "application/json; charset=utf-8",
                                      "Cache-Control": "no-store"})
+
+
+_CHAT_MEDIA_EXTS = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+    "image/webp": ".webp", "image/bmp": ".bmp",
+    "video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov",
+    "video/x-matroska": ".mkv", "video/3gpp": ".3gp",
+}
+_CHAT_MEDIA_MAX = 50 * 1024 * 1024  # 50MB
+
+
+def _chat_media_dir() -> Path:
+    env = (os.environ.get("MITM_DATA_DIR", "") or "").strip()
+    base = Path(env).expanduser().resolve() if env else _BASE
+    d = base / "chat_media"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _chat_upload_response(flow) -> Response:
+    ctx = user_auth.get_user_ctx_from_flow(flow)
+    me = (getattr(ctx, "username", "") or "").strip() if ctx else ""
+    if not me:
+        return Response.make(401, b'{"ok":false}', {"Content-Type": "application/json"})
+    if flow.request.method.upper() != "POST":
+        return Response.make(405, b'{"ok":false}', {"Content-Type": "application/json"})
+    ctype = flow.request.headers.get("Content-Type", "")
+    parts = _parse_multipart(ctype, flow.request.content or b"")
+    peer = ""
+    file_name = ""
+    file_data = b""
+    for name, filename, payload in parts:
+        if name == "peer":
+            try:
+                peer = payload.decode("utf-8", errors="replace").strip()
+            except (UnicodeDecodeError, AttributeError):
+                peer = ""
+        elif name == "file" and filename:
+            file_name = filename
+            file_data = payload
+    if not peer or not user_auth.user_exists(peer) or peer == me:
+        return Response.make(400, b'{"ok":false,"error":"bad_peer"}',
+                             {"Content-Type": "application/json"})
+    if not file_data:
+        return Response.make(400, b'{"ok":false,"error":"empty"}',
+                             {"Content-Type": "application/json"})
+    if len(file_data) > _CHAT_MEDIA_MAX:
+        return Response.make(400, b'{"ok":false,"error":"too_large"}',
+                             {"Content-Type": "application/json"})
+    # 判类型：先看扩展名，再 mimetypes 猜
+    ext = Path(file_name).suffix.lower()
+    guessed, _ = mimetypes.guess_type(file_name)
+    guessed = (guessed or "").lower()
+    if guessed.startswith("video/"):
+        media_type = "video"
+    elif guessed.startswith("image/"):
+        media_type = "image"
+    elif ext in (".mp4", ".webm", ".mov", ".mkv", ".3gp"):
+        media_type = "video"
+    elif ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"):
+        media_type = "image"
+    else:
+        return Response.make(400, b'{"ok":false,"error":"unsupported"}',
+                             {"Content-Type": "application/json"})
+    if not ext:
+        ext = _CHAT_MEDIA_EXTS.get(guessed, ".bin")
+    # 落盘
+    mid = base64.urlsafe_b64encode(os.urandom(12)).decode("ascii").rstrip("=")
+    d = _chat_media_dir()
+    fpath = d / (mid + ext)
+    try:
+        fpath.write_bytes(file_data)
+    except OSError:
+        return Response.make(500, b'{"ok":false,"error":"save_failed"}',
+                             {"Content-Type": "application/json"})
+    media = {"type": media_type, "url": f"/chat/media?id={mid}{ext}", "name": file_name[:80]}
+    msg = _chat_append_msg(me, peer, "", media)
+    body = json.dumps({"ok": True, "message": msg}, ensure_ascii=False).encode("utf-8")
+    return Response.make(200, body, {"Content-Type": "application/json; charset=utf-8",
+                                     "Cache-Control": "no-store"})
+
+
+def _chat_media_response(flow) -> Response:
+    """提供聊天媒体文件。需登录（任意已登录用户可取，id 不可枚举）。"""
+    ctx = user_auth.get_user_ctx_from_flow(flow)
+    me = (getattr(ctx, "username", "") or "").strip() if ctx else ""
+    if not me:
+        return Response.make(403, b"forbidden", {"Content-Type": "text/plain"})
+    mid = (_query_first(flow, "id") or "").strip()
+    # 防目录穿越：只允许 [A-Za-z0-9_-] + 单个扩展名
+    if not re.match(r"^[A-Za-z0-9_\-]+\.[A-Za-z0-9]+$", mid):
+        return _error_page("无效的媒体 id。", status=400)
+    fpath = _chat_media_dir() / mid
+    if not fpath.is_file():
+        return _error_page("媒体不存在。", status=404)
+    try:
+        data = fpath.read_bytes()
+    except OSError:
+        return _error_page("读取失败。", status=500)
+    mime, _ = mimetypes.guess_type(str(fpath))
+    return Response.make(200, data, {
+        "Content-Type": mime or "application/octet-stream",
+        "Cache-Control": "private, max-age=86400",
+        "Content-Length": str(len(data)),
+    })
 
 
 def _chat_page_response(flow) -> Response:
@@ -8498,11 +8611,24 @@ def _chat_page_response(flow) -> Response:
 .msg.theirs{align-self:flex-start;background:rgba(255,255,255,.1);color:#eef2ff;border-bottom-left-radius:4px}
 .msg .t{display:block;font-size:.66rem;opacity:.6;margin-top:3px;text-align:right}
 .conv-empty{margin:auto;color:var(--muted);font-size:.9rem;text-align:center;padding:20px}
-.conv-input{flex:0 0 auto;display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line);background:rgba(18,22,34,.6)}
+/* 右侧留出 56px，避开右下角全局「退出」悬浮键 */
+.conv-input{flex:0 0 auto;display:flex;gap:8px;align-items:flex-end;padding:10px 58px 10px 12px;border-top:1px solid var(--line);background:rgba(18,22,34,.6)}
 .conv-input textarea{flex:1;min-width:0;resize:none;height:42px;max-height:120px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.2);background:rgba(0,0,0,.3);color:#fff;font-size:.92rem;outline:none;font-family:inherit}
 .conv-input textarea:focus{border-color:#9dd1ff}
-.conv-input button{flex:0 0 auto;min-width:60px;border-radius:12px;border:none;background:linear-gradient(135deg,#5fa1ff,#b97cff);color:#fff;font-weight:700;font-size:.92rem;cursor:pointer}
+.conv-input button{flex:0 0 auto;min-width:60px;height:42px;border-radius:12px;border:none;background:linear-gradient(135deg,#5fa1ff,#b97cff);color:#fff;font-weight:700;font-size:.92rem;cursor:pointer}
 .conv-input button:disabled{opacity:.5}
+.conv-input .attach-btn{min-width:42px;width:42px;padding:0;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.18);font-size:1.2rem}
+.conv-input .attach-btn:active{background:rgba(255,255,255,.16)}
+/* 消息内的图片/视频 */
+.msg.media{padding:4px}
+.msg.media img,.msg.media video{display:block;max-width:100%;max-height:300px;border-radius:10px;cursor:pointer}
+.msg .cap{display:block;margin-top:4px;padding:0 6px 4px}
+/* 上传进度提示 */
+.upload-tip{align-self:center;color:var(--muted);font-size:.82rem;padding:6px 12px;background:rgba(255,255,255,.06);border-radius:10px}
+/* 图片全屏预览 */
+.media-viewer{position:fixed;inset:0;z-index:2147482900;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.92);padding:16px}
+.media-viewer.show{display:flex}
+.media-viewer img,.media-viewer video{max-width:100%;max-height:100%}
 @media (max-width:760px){
   .chat-contacts{flex-basis:100%;max-width:none}
   .chat-conv{display:none}
@@ -8528,11 +8654,14 @@ def _chat_page_response(flow) -> Response:
       <div class="conv-head"><span class="back" id="conv-back">‹ </span><span id="conv-title">选择联系人开始聊天</span></div>
       <div class="conv-scroll" id="conv"><div class="conv-empty">从左侧选择一位联系人</div></div>
       <div class="conv-input">
+        <button class="attach-btn" id="msg-attach" title="发送图片/视频" disabled>📎</button>
+        <input type="file" id="msg-file" accept="image/*,video/*" style="display:none">
         <textarea id="msg-input" placeholder="输入消息…" disabled></textarea>
         <button id="msg-send" disabled>发送</button>
       </div>
     </div>
   </div>
+  <div class="media-viewer" id="media-viewer"></div>
 </div>
 <script>
 (function(){
@@ -8543,6 +8672,9 @@ def _chat_page_response(flow) -> Response:
   var elTitle = document.getElementById('conv-title');
   var elInput = document.getElementById('msg-input');
   var elSend = document.getElementById('msg-send');
+  var elAttach = document.getElementById('msg-attach');
+  var elFile = document.getElementById('msg-file');
+  var elViewer = document.getElementById('media-viewer');
   var elPage = document.getElementById('chat-page');
   var peer = '';
   var lastId = 0;
@@ -8582,15 +8714,38 @@ def _chat_page_response(flow) -> Response:
       .then(function(d){ if(d&&d.ok) renderContacts(d.contacts||[]); }).catch(function(){});
   }
 
+  function openViewer(html){
+    elViewer.innerHTML = html;
+    elViewer.classList.add('show');
+  }
+  elViewer.addEventListener('click', function(){ elViewer.classList.remove('show'); elViewer.innerHTML=''; });
+
   function appendMsgs(msgs){
     var atBottom = (elConv.scrollHeight - elConv.scrollTop - elConv.clientHeight) < 60;
     msgs.forEach(function(m){
       if(seen[m.id]) return;
       seen[m.id] = 1;
       lastId = Math.max(lastId, m.id);
+      var mine = (m.from===ME);
       var div = document.createElement('div');
-      div.className = 'msg ' + (m.from===ME ? 'mine':'theirs');
-      div.innerHTML = esc(m.text) + '<span class="t">'+fmtTime(m.ts)+'</span>';
+      if(m.media && m.media.url){
+        div.className = 'msg media ' + (mine?'mine':'theirs');
+        var inner = '';
+        if(m.media.type==='video'){
+          inner = '<video src="'+esc(m.media.url)+'" controls preload="metadata" playsinline></video>';
+        } else {
+          inner = '<img src="'+esc(m.media.url)+'" alt="图片" loading="lazy">';
+        }
+        if(m.text){ inner += '<span class="cap">'+esc(m.text)+'</span>'; }
+        inner += '<span class="t">'+fmtTime(m.ts)+'</span>';
+        div.innerHTML = inner;
+        // 点击图片放大；视频用原生控件
+        var img = div.querySelector('img');
+        if(img){ img.addEventListener('click', function(){ openViewer('<img src="'+esc(m.media.url)+'">'); }); }
+      } else {
+        div.className = 'msg ' + (mine?'mine':'theirs');
+        div.innerHTML = esc(m.text) + '<span class="t">'+fmtTime(m.ts)+'</span>';
+      }
       elConv.appendChild(div);
     });
     if(atBottom){ elConv.scrollTop = elConv.scrollHeight; }
@@ -8601,7 +8756,7 @@ def _chat_page_response(flow) -> Response:
     peer = u; lastId = 0; seen = {};
     elTitle.textContent = u;
     elConv.innerHTML = '';
-    elInput.disabled = false; elSend.disabled = false;
+    elInput.disabled = false; elSend.disabled = false; elAttach.disabled = false;
     elPage.classList.add('show-conv');
     renderContacts(contactsCache);
     pollConv(true);
@@ -8629,6 +8784,41 @@ def _chat_page_response(flow) -> Response:
       .then(function(d){ if(d&&d.ok&&d.message){ appendMsgs([d.message]); elConv.scrollTop=elConv.scrollHeight; } })
       .catch(function(){});
   }
+
+  function uploadFile(file){
+    if(!file || !peer) return;
+    var maxMB = 50;
+    if(file.size > maxMB*1024*1024){ alert('文件过大，上限 '+maxMB+'MB'); return; }
+    var tip = document.createElement('div');
+    tip.className = 'upload-tip';
+    tip.textContent = '上传中… 0%';
+    elConv.appendChild(tip);
+    elConv.scrollTop = elConv.scrollHeight;
+    var fd = new FormData();
+    fd.append('peer', peer);
+    fd.append('file', file, file.name||'file');
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/chat/upload', true);
+    xhr.withCredentials = true;
+    xhr.upload.onprogress = function(e){
+      if(e.lengthComputable){ tip.textContent = '上传中… '+Math.round(e.loaded/e.total*100)+'%'; }
+    };
+    xhr.onload = function(){
+      tip.remove();
+      try{
+        var d = JSON.parse(xhr.responseText||'{}');
+        if(d.ok && d.message){ appendMsgs([d.message]); elConv.scrollTop = elConv.scrollHeight; }
+        else { alert('发送失败：'+(d.error||xhr.status)); }
+      }catch(e){ alert('发送失败'); }
+    };
+    xhr.onerror = function(){ tip.remove(); alert('上传出错'); };
+    xhr.send(fd);
+  }
+  elAttach.addEventListener('click', function(){ if(peer) elFile.click(); });
+  elFile.addEventListener('change', function(){
+    if(elFile.files && elFile.files[0]) uploadFile(elFile.files[0]);
+    elFile.value = '';
+  });
 
   elSend.addEventListener('click', send);
   elInput.addEventListener('keydown', function(e){
@@ -8803,6 +8993,10 @@ def _route(flow) -> Response:
             return _chat_poll_response(flow)
         if path == "/chat/send":
             return _chat_send_response(flow)
+        if path == "/chat/upload":
+            return _chat_upload_response(flow)
+        if path == "/chat/media":
+            return _chat_media_response(flow)
         if path == "/subtitle":
             return _subtitle_response(flow)
         if path == "/subtitle_internal":
